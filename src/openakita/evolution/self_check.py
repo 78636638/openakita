@@ -562,15 +562,64 @@ ID: {result.test_id}
 
     async def learn_from_check(self, report: CheckReport) -> None:
         """从自检中学习"""
-        if report.failed > 0:
-            # 记录失败模式
-            failures = [r for r in report.results if not r.passed]
+        if not settings.learning_loop_enabled or report.failed <= 0:
+            return
 
-            for failure in failures:
-                logger.info(f"Learning from failure: {failure.test_id}")
+        cases = self._build_cases_from_check(report)
+        if not cases:
+            return
 
-                # TODO: 将失败模式记录到记忆系统
-                # 这样下次遇到类似问题时可以避免
+        inserted = self._write_check_cases(cases)
+        written = self._generate_check_memory_feedback(cases)
+        logger.info(
+            "Learned from self-check: cases=%s inserted=%s memory_written=%s",
+            len(cases),
+            inserted,
+            written,
+        )
+
+    def _build_cases_from_check(self, report: CheckReport) -> list:
+        from ..learning.case_builder import LearningCaseBuilder
+
+        return LearningCaseBuilder().from_check_report(report)
+
+    def _write_check_cases(self, cases: list) -> int:
+        from ..learning.store import LearningStore
+
+        store = LearningStore()
+        inserted = 0
+        for case in cases:
+            case_id, created = store.upsert_case(case)
+            case.case_id = case_id
+            if created:
+                inserted += 1
+        return inserted
+
+    def _generate_check_memory_feedback(self, cases: list) -> int:
+        from ..learning.feedback_writer import MemoryFeedbackWriter
+        from ..learning.store import LearningStore
+
+        if not self._memory_manager:
+            return 0
+
+        store = LearningStore()
+        writer = MemoryFeedbackWriter(
+            self._memory_manager,
+            min_repeat=settings.learning_min_repeat_for_memory_write,
+        )
+        written = 0
+        for case in cases:
+            repeat_count = store.count_similar_problem(case.problem_summary, domain=case.domain)
+            memory_ids = writer.write_case(case, repeat_count=repeat_count)
+            if memory_ids:
+                written += len(memory_ids)
+                store.mark_reviewed(
+                    case.case_id,
+                    memory_ids=memory_ids,
+                    note="memory_written",
+                    written=True,
+                )
+        return written
 
     # ==================== 日志分析与自动修复 ====================
 

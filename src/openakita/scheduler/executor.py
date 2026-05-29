@@ -866,6 +866,12 @@ class TaskExecutor:
         支持的系统任务:
         - system:daily_memory - 每日记忆整理
         - system:daily_selfcheck - 每日系统自检
+        - system:daily_evaluation - 每日评估并沉淀学习案例
+        - system:hourly_learning_ingest - 学习案例增量摄取
+        - system:daily_learning_review - 学习案例回写记忆
+        - system:learning_shadow - 学习案例低风险 shadow 预演
+        - system:learning_promote - 学习案例低风险动作受控 apply
+        - system:learning_verifier - 学习案例低风险动作验证与回滚
         - system:proactive_heartbeat - 活人感心跳
         - system:workspace_backup - 定时工作区备份
         - system:memory_nudge_review - 周期性记忆回顾
@@ -885,6 +891,12 @@ class TaskExecutor:
         SYSTEM_TASK_TIMEOUTS = {
             "system:daily_selfcheck": max(settings.scheduler_task_timeout, 1200),
             "system:daily_memory": 1800,  # 30 分钟（含 LLM review 大量记忆）
+            "system:daily_evaluation": 1800,
+            "system:hourly_learning_ingest": 300,
+            "system:daily_learning_review": 600,
+            "system:learning_shadow": 300,
+            "system:learning_promote": 300,
+            "system:learning_verifier": 300,
             "system:workspace_backup": 300,  # 5 分钟
             "system:memory_nudge_review": 120,  # 2 分钟（轻量 LLM 审视）
         }
@@ -892,7 +904,13 @@ class TaskExecutor:
         budget_tokens = (
             settings.scheduler_background_token_budget
             if action
-            in {"system:daily_selfcheck", "system:daily_memory", "system:memory_nudge_review"}
+            in {
+                "system:daily_selfcheck",
+                "system:daily_memory",
+                "system:daily_evaluation",
+                "system:memory_nudge_review",
+                "system:daily_learning_review",
+            }
             else 0
         )
         budget_token = set_token_budget(
@@ -907,6 +925,18 @@ class TaskExecutor:
             elif action == "system:daily_selfcheck":
                 soft_timeout = max(timeout - 30, 1) if timeout else None
                 coro = self._system_daily_selfcheck(soft_timeout)
+            elif action == "system:daily_evaluation":
+                coro = self._system_daily_evaluation()
+            elif action == "system:hourly_learning_ingest":
+                coro = self._system_learning_ingest()
+            elif action == "system:daily_learning_review":
+                coro = self._system_learning_review()
+            elif action == "system:learning_shadow":
+                coro = self._system_learning_shadow()
+            elif action == "system:learning_promote":
+                coro = self._system_learning_promote()
+            elif action == "system:learning_verifier":
+                coro = self._system_learning_verifier()
             elif action == "system:proactive_heartbeat":
                 return await self._system_proactive_heartbeat(task)
             elif action == "system:workspace_backup":
@@ -1049,6 +1079,133 @@ class TaskExecutor:
 
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
+            return False, str(e)
+
+    async def _system_learning_ingest(self) -> tuple[bool, str]:
+        """执行学习案例增量摄取。"""
+        try:
+            from ..config import settings
+            from ..learning.scheduler_hooks import run_learning_ingest
+
+            if not settings.learning_loop_enabled or not settings.learning_ingest_enabled:
+                return True, "learning ingest disabled"
+
+            scanned, inserted = run_learning_ingest()
+            summary = f"学习摄取完成: 扫描 {scanned} 个分析文件，新增 {inserted} 个 LearningCase"
+            logger.info(summary)
+            return True, summary
+        except Exception as e:
+            logger.error(f"Learning ingest failed: {e}")
+            return False, str(e)
+
+    async def _system_daily_evaluation(self) -> tuple[bool, str]:
+        """执行每日评估，并把需关注结果沉淀到 learning store。"""
+        try:
+            from ..config import settings
+            from ..core.brain import Brain
+            from ..learning.scheduler_hooks import run_daily_evaluation
+
+            if not settings.evaluation_enabled:
+                return True, "daily evaluation disabled"
+
+            brain = getattr(self.memory_manager, "brain", None) if self.memory_manager else None
+            summary = await run_daily_evaluation(brain=brain or Brain())
+            if summary.get("status") == "no_data":
+                return True, "每日评估完成: 没有可评估的 trace"
+            message = (
+                "每日评估完成: "
+                f"评估 {summary.get('traces_evaluated', 0)} 个 trace，"
+                f"生成 {summary.get('generated_cases', 0)} 个 LearningCase，"
+                f"新增 {summary.get('inserted_cases', 0)} 个案例"
+            )
+            logger.info(message)
+            return True, message
+        except Exception as e:
+            logger.error(f"Daily evaluation failed: {e}")
+            return False, str(e)
+
+    async def _system_learning_review(self) -> tuple[bool, str]:
+        """执行学习案例回顾，并把高价值经验写入长期记忆。"""
+        try:
+            from ..config import settings
+            from ..learning.scheduler_hooks import run_learning_review
+
+            if not settings.learning_loop_enabled or not settings.learning_ingest_enabled:
+                return True, "learning review disabled"
+
+            reviewed, written = run_learning_review(self.memory_manager)
+            summary = f"学习回顾完成: 回顾 {reviewed} 个 LearningCase，写入 {written} 条长期记忆"
+            logger.info(summary)
+            return True, summary
+        except Exception as e:
+            logger.error(f"Learning review failed: {e}")
+            return False, str(e)
+
+    async def _system_learning_shadow(self) -> tuple[bool, str]:
+        """执行学习案例 shadow 流程，并对低风险候选动作做 dry-run 预演。"""
+        try:
+            from ..config import settings
+            from ..learning.shadow import run_learning_shadow
+
+            if not settings.learning_loop_enabled or not settings.learning_scheduler_primary:
+                return True, "learning shadow disabled"
+
+            summary = run_learning_shadow()
+            message = (
+                "学习 Shadow 完成: "
+                f"规划 {summary.get('planned_cases', 0)} 个案例，"
+                f"生成 {summary.get('generated_actions', 0)} 个候选动作，"
+                f"dry-run {summary.get('shadowed_actions', 0)} 个动作，"
+                f"跳过 {summary.get('skipped_existing_records', 0)} 个已有记录"
+            )
+            logger.info(message)
+            return True, message
+        except Exception as e:
+            logger.error(f"Learning shadow failed: {e}")
+            return False, str(e)
+
+    async def _system_learning_verifier(self) -> tuple[bool, str]:
+        """执行学习案例 verifier 流程，对已应用动作做验证并在失败时回滚。"""
+        try:
+            from ..config import settings
+            from ..learning.verifier import run_learning_verifier
+
+            if not settings.learning_loop_enabled or not settings.learning_scheduler_primary:
+                return True, "learning verifier disabled"
+
+            summary = run_learning_verifier()
+            message = (
+                "学习 Verifier 完成: "
+                f"尝试验证 {summary.get('attempted_actions', 0)} 个动作，"
+                f"通过 {summary.get('verified_actions', 0)} 个，"
+                f"回滚 {summary.get('rolled_back_actions', 0)} 个"
+            )
+            logger.info(message)
+            return True, message
+        except Exception as e:
+            logger.error(f"Learning verifier failed: {e}")
+            return False, str(e)
+
+    async def _system_learning_promote(self) -> tuple[bool, str]:
+        """执行学习案例 promote 流程，将已 dry-run 的低风险动作提升为 apply。"""
+        try:
+            from ..config import settings
+            from ..learning.promote import run_learning_promote
+
+            if not settings.learning_loop_enabled or not settings.learning_scheduler_primary:
+                return True, "learning promote disabled"
+
+            summary = run_learning_promote()
+            message = (
+                "学习 Promote 完成: "
+                f"发现 {summary.get('eligible_actions', 0)} 个可提升动作，"
+                f"成功 apply {summary.get('promoted_actions', 0)} 个，"
+                f"拒绝 {summary.get('rejected_actions', 0)} 个"
+            )
+            logger.info(message)
+            return True, message
+        except Exception as e:
+            logger.error(f"Learning promote failed: {e}")
             return False, str(e)
 
     async def _system_memory_nudge_review(self) -> tuple[bool, str]:

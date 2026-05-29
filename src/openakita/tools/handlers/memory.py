@@ -668,7 +668,11 @@ class MemoryHandler:
                             if c.memory_id
                         ]
                         if cited:
-                            mm.record_cited_memories(cited)
+                            mm.record_cited_memories(
+                                cited,
+                                query=query,
+                                source="search_memory",
+                            )
                         output = f"找到 {len(candidates)} 条相关记忆:\n\n"
                         for c in candidates[:10]:
                             ep_hint = ""
@@ -698,7 +702,11 @@ class MemoryHandler:
                         f"[search_memory] SQLite: {len(memories)} results for '{query[:50]}'"
                     )
                     cited = [{"id": m.id, "content": m.content[:200]} for m in memories]
-                    mm.record_cited_memories(cited)
+                    mm.record_cited_memories(
+                        cited,
+                        query=query,
+                        source="search_memory",
+                    )
                     output = f"找到 {len(memories)} 条相关记忆:\n\n"
                     for m in memories:
                         ep_hint = (
@@ -740,7 +748,11 @@ class MemoryHandler:
             return output
 
         cited = [{"id": m.id, "content": m.content[:200]} for m in memories]
-        mm.record_cited_memories(cited)
+        mm.record_cited_memories(
+            cited,
+            query=query,
+            source="search_memory",
+        )
 
         output = f"找到 {len(memories)} 条相关记忆:\n\n"
         for m in memories:

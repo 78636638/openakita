@@ -110,6 +110,36 @@ class Settings(BaseSettings):
         default=True,
         description="自检时是否执行自动修复（设为 false 则只分析不修复）",
     )
+    learning_loop_enabled: bool = Field(
+        default=True,
+        description="是否启用记忆与自主进化学习闭环主开关。",
+    )
+    learning_ingest_enabled: bool = Field(
+        default=True,
+        description="是否启用 learning ingest / review 定时任务。",
+    )
+    learning_manual_trigger_enabled: bool = Field(
+        default=True,
+        description="是否允许后续通过手动入口触发 learning ingest / review。",
+    )
+    learning_scheduler_primary: bool = Field(
+        default=True,
+        description="是否由 Scheduler 作为 learning 闭环默认主入口。",
+    )
+    learning_case_retention_days: int = Field(
+        default=180,
+        ge=7,
+        description="LearningCase 在 learning store 中的默认保留时长（天）。",
+    )
+    learning_min_repeat_for_memory_write: int = Field(
+        default=2,
+        ge=1,
+        description="非高优先级 LearningCase 写回长期记忆前所需的最小重复次数。",
+    )
+    learning_enable_low_risk_autofix: bool = Field(
+        default=False,
+        description="是否启用低风险自动优化（当前为后续阶段预留，默认关闭）。",
+    )
 
     # === 任务超时策略 ===
     # 默认对齐 Claude Code 哲学：CLI/IM 真人对话场景不做"agent 自检自杀"，

@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ..config import settings
 from ..core.log_health import record_health_event
 from .consolidator import MemoryConsolidator
 from .exceptions import MemoryStorageUnavailable
@@ -276,8 +277,16 @@ class MemoryManager:
                 api_key=embedding_api_key,
                 api_model=embedding_api_model,
             )
+            with contextlib.suppress(Exception):
+                from ..learning.hit_tracker import LearningHitTracker
+
+                self.learning_hit_tracker = LearningHitTracker()
             # v2: Retrieval Engine (with brain for LLM query decomposition)
-            self.retrieval_engine = RetrievalEngine(self.store, brain=brain)
+            self.retrieval_engine = RetrievalEngine(
+                self.store,
+                brain=brain,
+                hit_recorder=self._record_retrieval_hits,
+            )
             # Subscribe to DB write events: every successful save/update/delete
             # going through ``self.store`` now keeps ``self._memories`` coherent
             # automatically — including writes from LifecycleManager, API
@@ -1004,18 +1013,38 @@ class MemoryManager:
         if self._current_session_id:
             self.consolidator.save_conversation_turn(self._current_session_id, turn)
 
-    def record_cited_memories(self, memories: list[dict]) -> None:
+    def record_cited_memories(
+        self,
+        memories: list[dict],
+        *,
+        query: str = "",
+        source: str = "search_memory",
+    ) -> None:
         """Record memories retrieved via search_memory for later LLM scoring.
 
         Args:
             memories: list of {id, content} dicts
         """
+        if settings.learning_loop_enabled:
+            with contextlib.suppress(Exception):
+                tracker = getattr(self, "learning_hit_tracker", None)
+                if tracker:
+                    tracker.record_cited_memories(memories, query=query, source=source)
         seen = {m["id"] for m in self._session_cited_memories}
         for m in memories:
             mid = m.get("id", "")
             if mid and mid not in seen:
                 self._session_cited_memories.append({"id": mid, "content": m.get("content", "")})
                 seen.add(mid)
+
+    def _record_retrieval_hits(self, query: str, candidates: list[Any], source: str) -> None:
+        memories = [
+            {"id": getattr(candidate, "memory_id", ""), "content": getattr(candidate, "content", "")}
+            for candidate in candidates
+            if getattr(candidate, "memory_id", "")
+        ]
+        if memories:
+            self.record_cited_memories(memories, query=query, source=source)
 
     def _consume_cited_memories(self) -> list[dict]:
         """Consume and return accumulated cited memories, clearing the buffer."""

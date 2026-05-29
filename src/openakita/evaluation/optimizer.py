@@ -482,6 +482,21 @@ class DailyEvaluator:
         """设置 LLM 客户端"""
         self._judge.set_brain(brain)
 
+    async def collect_daily_eval(
+        self,
+    ) -> tuple[EvalMetrics, list[EvalResult], list[OptimizationAction], str | None]:
+        """运行评估并收集结果，但不执行优化动作。"""
+        logger.info("[DailyEval] Starting daily evaluation...")
+
+        metrics, results = await self._runner.run_evaluation()
+        if not results:
+            logger.info("[DailyEval] No traces to evaluate")
+            return EvalMetrics(), [], [], None
+
+        report_path = await self._reporter.save(metrics, results)
+        actions = self._analyzer.analyze(metrics, results)
+        return metrics, results, actions, report_path
+
     async def run_daily_eval(self, dry_run: bool = False) -> dict[str, Any]:
         """
         运行每日评估。
@@ -489,22 +504,11 @@ class DailyEvaluator:
         Returns:
             评估摘要 dict
         """
-        logger.info("[DailyEval] Starting daily evaluation...")
-
-        # 1. 运行评估
-        metrics, results = await self._runner.run_evaluation()
-
+        metrics, results, actions, report_path = await self.collect_daily_eval()
         if not results:
-            logger.info("[DailyEval] No traces to evaluate")
             return {"status": "no_data"}
 
-        # 2. 保存报告
-        report_path = await self._reporter.save(metrics, results)
-
-        # 3. 分析改进机会
-        actions = self._analyzer.analyze(metrics, results)
-
-        # 4. 执行优化
+        # 仅保留向后兼容的旧行为：评估后仍可选择执行旧版优化动作。
         applied = await self._optimizer.apply_actions(actions, dry_run=dry_run)
 
         summary = {

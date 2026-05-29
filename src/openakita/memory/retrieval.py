@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -181,9 +182,16 @@ class RetrievalEngine:
         "只输出 JSON，不要其他内容。"
     )
 
-    def __init__(self, store: UnifiedStore, brain=None) -> None:
+    def __init__(
+        self,
+        store: UnifiedStore,
+        brain=None,
+        *,
+        hit_recorder: Callable[[str, list[RetrievalCandidate], str], None] | None = None,
+    ) -> None:
         self.store = store
         self.brain = brain
+        self._hit_recorder = hit_recorder
         self._decompose_cache: dict[str, dict] = {}
         self._external_sources: list = []
         self._plugin_hooks = None
@@ -267,6 +275,7 @@ class RetrievalEngine:
         ranked = self._rerank(candidates, query, active_persona)
 
         self._dispatch_on_retrieve_sync(query, ranked)
+        self._record_hits(query, ranked, source="auto_retrieval")
 
         return self._format_within_budget(ranked, max_tokens)
 
@@ -303,6 +312,7 @@ class RetrievalEngine:
 
         ranked = self._rerank(candidates, query)
         self._dispatch_on_retrieve_sync(query, ranked)
+        self._record_hits(query, ranked[:limit], source="search_memory")
         return ranked[:limit]
 
     # ==================================================================
@@ -379,6 +389,14 @@ class RetrievalEngine:
                 logger.debug(f"on_retrieve hook from '{plugin_id}' error: {e}")
                 if error_tracker:
                     error_tracker.record_error(plugin_id, "hook:on_retrieve", str(e))
+
+    def _record_hits(self, query: str, candidates: list[RetrievalCandidate], *, source: str) -> None:
+        if self._hit_recorder is None or not candidates:
+            return
+        try:
+            self._hit_recorder(query, candidates, source)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Retrieval] hit recorder failed: %s", exc)
 
     # ==================================================================
     # Multi-way Recall

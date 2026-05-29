@@ -8,6 +8,14 @@ Welcome to the OpenAkita documentation.
 |----------|-------------|
 | [Getting Started](getting-started.md) | Installation and first steps |
 | [Architecture](architecture.md) | System design and components |
+| [Chat Workflow](chat-workflow.md) | Dialogue lifecycle, SSE events, tool loop, and persistence flow |
+| [Learning Closed Loop](learning-closed-loop.md) | End-to-end design for memory, evaluation, self-check, optimization, and optional model fine-tuning |
+| [Learning Loop Spec](learning-loop-implementation-spec.md) | Implementation-ready specification for the memory and autonomous evolution closed loop |
+| [Learning Loop Development Plan](learning-loop-development-plan.md) | Step-by-step development roadmap, task phases, testing, acceptance, and rollback plan |
+| [Learning Loop Progress](learning-loop-progress.md) | Phase progress, verification results, and current Phase 3 delivery status for the learning loop |
+| [Memory Sequence](memory-sequence.md) | Memory write, extract, retrieve, inject, and daily consolidation sequence |
+| [Mode2 Deep Dive](memory-mode2-deep-dive.md) | Relational graph memory internals and mode1 vs mode2 comparison |
+| [Source Code Tour](source-code-tour.md) | Repository map and backend code reading guide |
 | [Configuration](configuration.md) | All configuration options |
 
 ## Setup Tutorials
@@ -45,6 +53,14 @@ docs/
 ├── README.md                        # This file
 ├── getting-started.md               # Quick start guide
 ├── architecture.md                  # System architecture
+├── chat-workflow.md                 # Chat/dialogue mechanism and end-to-end workflow
+├── learning-closed-loop.md          # Closed-loop learning and self-evolution design
+├── learning-loop-implementation-spec.md  # Implementation-ready learning loop spec
+├── learning-loop-development-plan.md     # Step-by-step development roadmap
+├── learning-loop-progress.md             # Phase progress and handoff summary
+├── memory-sequence.md               # Memory system sequence and lifecycle
+├── memory-mode2-deep-dive.md        # Relational memory deep dive and mode comparison
+├── source-code-tour.md              # Source code tour and reading guide
 ├── configuration.md                 # Configuration reference
 ├── configuration-guide.md           # Desktop app setup walkthrough
 ├── llm-provider-setup-tutorial.md   # ⭐ LLM provider setup tutorial
@@ -67,4 +83,3 @@ Found an error or want to improve the documentation?
 3. Submit a pull request
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for details.
-

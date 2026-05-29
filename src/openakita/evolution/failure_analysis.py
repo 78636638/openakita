@@ -79,6 +79,12 @@ class FailureAnalysisResult:
     suggestion: str = ""
     raw_data: dict[str, Any] = field(default_factory=dict)
 
+    def to_learning_case(self):
+        """Convert analysis result into a Phase 1 LearningCase."""
+        from ..learning.case_builder import LearningCaseBuilder
+
+        return LearningCaseBuilder().from_failure_analysis(self)
+
 
 class FailureAnalyzer:
     """
@@ -155,6 +161,7 @@ class FailureAnalyzer:
 
         self._results.append(result)
         self._persist_result(result)
+        self._persist_learning_case(result)
 
         logger.info(
             f"[FailureAnalysis] task={task_id[:8]} root_cause={root_cause.value} "
@@ -427,6 +434,16 @@ class FailureAnalyzer:
 
         except Exception as e:
             logger.warning(f"[FailureAnalysis] Failed to persist result: {e}")
+
+    def _persist_learning_case(self, result: FailureAnalysisResult) -> None:
+        """Persist Phase 1 learning case without affecting failure analysis main flow."""
+        try:
+            from ..learning.store import LearningStore
+
+            store = LearningStore()
+            store.upsert_case(result.to_learning_case())
+        except Exception as e:
+            logger.debug(f"[FailureAnalysis] Failed to persist learning case: {e}")
 
     def get_recent_results(self, limit: int = 20) -> list[FailureAnalysisResult]:
         """获取最近的分析结果"""

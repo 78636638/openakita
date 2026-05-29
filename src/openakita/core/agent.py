@@ -3394,7 +3394,129 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to register memory_nudge task: {e}")
 
-        # 任务 5: 工作区定时备份（根据用户设置）
+        # 任务 5: Learning ingest / review / shadow / promote / verifier
+        try:
+            if (
+                settings.learning_loop_enabled
+                and settings.learning_ingest_enabled
+                and settings.learning_scheduler_primary
+            ):
+                ingest_task_id = "system_learning_ingest"
+                if ingest_task_id not in existing_ids:
+                    ingest_task = ScheduledTask(
+                        id=ingest_task_id,
+                        name="学习摄取",
+                        trigger_type=TriggerType.INTERVAL,
+                        trigger_config={"interval_minutes": 60},
+                        action="system:hourly_learning_ingest",
+                        prompt="执行 learning ingest：汇总 failure analysis 等学习案例",
+                        description="每小时汇总一次学习案例",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(ingest_task)
+                    logger.info("Registered system task: learning_ingest (every 60 min)")
+
+                review_task_id = "system_learning_review"
+                if review_task_id not in existing_ids:
+                    review_task = ScheduledTask(
+                        id=review_task_id,
+                        name="学习回顾",
+                        trigger_type=TriggerType.CRON,
+                        trigger_config={"cron": "0 5 * * *"},
+                        action="system:daily_learning_review",
+                        prompt="执行 learning review：将高价值学习案例写入长期记忆",
+                        description="每天清晨回顾学习案例并写入长期记忆",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(review_task)
+                    logger.info("Registered system task: learning_review (05:00)")
+
+                shadow_task_id = "system_learning_shadow"
+                if shadow_task_id not in existing_ids:
+                    shadow_task = ScheduledTask(
+                        id=shadow_task_id,
+                        name="学习 Shadow",
+                        trigger_type=TriggerType.CRON,
+                        trigger_config={"cron": "30 5 * * *"},
+                        action="system:learning_shadow",
+                        prompt="执行 learning shadow：规划低风险候选动作并进行 dry-run 预演",
+                        description="每天在 learning review 后执行一次 shadow dry-run",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(shadow_task)
+                    logger.info("Registered system task: learning_shadow (05:30)")
+
+                promote_task_id = "system_learning_promote"
+                if promote_task_id not in existing_ids:
+                    promote_task = ScheduledTask(
+                        id=promote_task_id,
+                        name="学习 Promote",
+                        trigger_type=TriggerType.CRON,
+                        trigger_config={"cron": "45 5 * * *"},
+                        action="system:learning_promote",
+                        prompt="执行 learning promote：将已完成 dry-run 的低风险动作受控提升为 apply",
+                        description="每天在 learning shadow 后执行一次最小 promote/apply",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(promote_task)
+                    logger.info("Registered system task: learning_promote (05:45)")
+
+                verifier_task_id = "system_learning_verifier"
+                if verifier_task_id not in existing_ids:
+                    verifier_task = ScheduledTask(
+                        id=verifier_task_id,
+                        name="学习 Verifier",
+                        trigger_type=TriggerType.CRON,
+                        trigger_config={"cron": "0 6 * * *"},
+                        action="system:learning_verifier",
+                        prompt="执行 learning verifier：验证已应用的低风险动作并在失败时回滚",
+                        description="每天在 learning shadow 后执行一次 verifier 检查",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(verifier_task)
+                    logger.info("Registered system task: learning_verifier (06:00)")
+        except Exception as e:
+            logger.warning(f"Failed to register learning tasks: {e}")
+
+        # 任务 6: Daily evaluation
+        try:
+            if settings.evaluation_enabled:
+                evaluation_task_id = "system_daily_evaluation"
+                if evaluation_task_id not in existing_ids:
+                    evaluation_task = ScheduledTask(
+                        id=evaluation_task_id,
+                        name="每日评估",
+                        trigger_type=TriggerType.CRON,
+                        trigger_config={"cron": "30 4 * * *"},
+                        action="system:daily_evaluation",
+                        prompt="执行 daily evaluation：评估 traces 并将需关注结果沉淀为 LearningCase",
+                        description="每日运行评估并把需关注结果写入 learning store",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(evaluation_task)
+                    logger.info("Registered system task: daily_evaluation (04:30)")
+        except Exception as e:
+            logger.warning(f"Failed to register daily evaluation task: {e}")
+
+        # 任务 7: 工作区定时备份（根据用户设置）
         try:
             from ..workspace.backup import read_backup_settings
 
@@ -10115,4 +10237,3 @@ class Agent:
     def get_memory_stats(self) -> dict:
         """获取记忆统计"""
         return self.memory_manager.get_stats()
-
