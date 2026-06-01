@@ -71,8 +71,8 @@ class PlaywrightTools:
             error_str = str(e)
             logger.error(f"Navigation failed: {e}")
             if "closed" in error_str.lower() or "target" in error_str.lower():
-                logger.warning("[Browser] Browser/page closed, resetting state")
-                await self._manager.reset_state()
+                logger.warning("[Browser] Browser/page closed, cleaning up state")
+                await self._manager.cleanup_disconnected_state()
                 return {
                     "success": False,
                     "error": "浏览器已关闭（可能被用户关闭或崩溃）。\n"
@@ -125,12 +125,14 @@ class PlaywrightTools:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = str(screenshots_dir / f"screenshot_{timestamp}.png")
 
-        Path(path).write_bytes(screenshot_bytes)
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(screenshot_bytes)
         result_data: dict = {
-            "saved_to": path,
+            "saved_to": str(out_path),
             "page_url": current_url,
             "page_title": page_title,
-            "message": f"截图已保存到: {path}",
+            "message": f"截图已保存到: {out_path}",
             "hint": (
                 "如需将截图交付给用户，请使用 deliver_artifacts 工具。"
                 "如需确认截图内容，可使用 view_image 工具查看截图。"
@@ -416,8 +418,8 @@ class PlaywrightTools:
             error_str = str(e)
             logger.error(f"Failed to open new tab: {e}")
             if "closed" in error_str.lower() or "target" in error_str.lower():
-                logger.warning("[Browser] Browser/page closed, resetting state")
-                await self._manager.reset_state()
+                logger.warning("[Browser] Browser/page closed, cleaning up state")
+                await self._manager.cleanup_disconnected_state()
                 return {
                     "success": False,
                     "error": "浏览器已关闭。请先调用 browser_close 然后重新调用 browser_open 启动浏览器。",

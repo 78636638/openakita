@@ -55,6 +55,10 @@ _DEFAULTS: dict[str, bool] = {
     "intent_tool_slim_v1": True,
     # P1-2
     "text_replace_on_restart_v1": True,
+    # Callchain D1
+    "prompt_cache_isolation_v1": True,
+    # Callchain D2
+    "memory_tenant_guard_v1": True,
 }
 
 

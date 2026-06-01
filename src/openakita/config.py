@@ -762,11 +762,11 @@ class Settings(BaseSettings):
         description="全局上下文最大输入长度 (tokens)。实际生效时取 min(此值, 端点 context_window)。0=不限制，直接使用端点上限",
     )
     context_compression_ratio: float = Field(
-        default=0.25,
+        default=0.20,
         description="上下文压缩目标比例，早期对话压缩到原文的该百分比 (0.05~0.5)",
     )
     context_compression_threshold: float = Field(
-        default=0.85,
+        default=0.65,
         description="触发压缩的软限比例——上下文 token 数超过硬上限的该比例时开始压缩 (0.5~0.95，越大越晚触发)",
     )
     context_boundary_compression_ratio: float = Field(
@@ -774,7 +774,7 @@ class Settings(BaseSettings):
         description="跨话题边界压缩比例，旧话题压缩到该百分比 (0.05~0.5)",
     )
     context_min_recent_turns: int = Field(
-        default=12,
+        default=6,
         description="压缩时至少保留的最近对话组数 (4~20)",
     )
     context_enable_tool_compression: bool = Field(
@@ -819,7 +819,7 @@ class Settings(BaseSettings):
         description="单轮工具结果进入上下文前的总字符预算（后续会按上下文压力动态调整）",
     )
     api_tools_schema_budget_tokens: int = Field(
-        default=12000,
+        default=20000,
         description="发送给 LLM API 的 tools schema 估算 token 预算，超出后动态 defer 非核心工具",
     )
     same_tool_call_limit: int = Field(

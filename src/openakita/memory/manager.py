@@ -60,10 +60,118 @@ logger = logging.getLogger(__name__)
 
 _apply_retention = apply_retention
 _UNSET_OWNER = object()
+_LOCAL_MEMORY_SAFE_CHANNELS = frozenset({"cli", "desktop", "web"})
+_REMOTE_MEMORY_RISK_CHANNELS = frozenset(
+    {"api", "feishu", "telegram", "wecom", "dingtalk", "qq", "onebot"}
+)
+_PLACEHOLDER_TENANT_USERS = frozenset({"", "anonymous", "legacy", "system"})
+_REMOTE_FALLBACK_TENANT_USERS = frozenset({"default", "api_user", "desktop_user"})
 
 
 class MemoryManager:
     """记忆管理器 (v2)"""
+
+    def _infer_session_channel(self, session_id: str, session: object | None = None) -> str:
+        channel = str(getattr(session, "channel", "") or "").strip().lower()
+        if channel:
+            return channel
+        raw = str(session_id or "").strip()
+        if "__" in raw:
+            return raw.split("__", 1)[0].strip().lower()
+        if ":" in raw:
+            return raw.split(":", 1)[0].strip().lower()
+        return ""
+
+    def _classify_tenant_context(
+        self,
+        *,
+        session_id: str = "",
+        user_id: str = "",
+        workspace_id: str = "",
+        session: object | None = None,
+    ) -> dict[str, Any]:
+        channel = self._infer_session_channel(session_id, session)
+        user = str(user_id or "").strip()
+        workspace = str(workspace_id or "").strip() or "default"
+        local_safe = channel in _LOCAL_MEMORY_SAFE_CHANNELS or (
+            not channel and user in {"default", "desktop_user"}
+        )
+        placeholder_user = user in _PLACEHOLDER_TENANT_USERS
+        remote_fallback_user = channel in _REMOTE_MEMORY_RISK_CHANNELS and (
+            user in _REMOTE_FALLBACK_TENANT_USERS or placeholder_user
+        )
+        tenant_trusted = local_safe or (
+            user
+            and not placeholder_user
+            and not remote_fallback_user
+        )
+        if tenant_trusted:
+            source = "local_safe" if local_safe else "remote_personal"
+            reason = ""
+        elif remote_fallback_user:
+            source = "remote_fallback"
+            reason = (
+                "remote session is using a shared fallback user id; block long-term writes "
+                "to avoid cross-tenant memory pollution"
+            )
+        elif placeholder_user:
+            source = "placeholder_user"
+            reason = "placeholder user id does not identify a real tenant"
+        else:
+            source = "unknown_session"
+            reason = "session tenant source is missing; keep long-term memory disabled"
+        return {
+            "channel": channel or "unknown",
+            "user_id": user or "default",
+            "workspace_id": workspace,
+            "tenant_trusted": tenant_trusted,
+            "register_session_tenant": tenant_trusted,
+            "source": source,
+            "reason": reason,
+        }
+
+    def _record_memory_guard_notice(self, notice: str) -> None:
+        self._last_memory_guard_notice = str(notice or "").strip()
+
+    def pop_memory_guard_notice(self) -> str:
+        notice = str(getattr(self, "_last_memory_guard_notice", "") or "")
+        self._last_memory_guard_notice = ""
+        return notice
+
+    def _guard_long_term_memory_write(
+        self,
+        *,
+        scope: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> str:
+        from ..core.feature_flags import is_enabled as _ff_enabled
+
+        if scope != "user" or not _ff_enabled("memory_tenant_guard_v1"):
+            return ""
+        tenant = self._classify_tenant_context(
+            session_id=self._current_session_id or "",
+            user_id=user_id,
+            workspace_id=workspace_id,
+            session=getattr(self, "_current_session_obj", None),
+        )
+        if tenant["tenant_trusted"]:
+            return ""
+        notice = (
+            "已跳过长期记忆写入：当前会话缺少可信 tenant，继续写入可能造成跨租户污染。"
+        )
+        logger.warning(
+            "[Memory] blocked long-term write scope=%s channel=%s user_id=%r workspace_id=%r "
+            "source=%s reason=%s",
+            scope,
+            tenant["channel"],
+            tenant["user_id"],
+            tenant["workspace_id"],
+            tenant["source"],
+            tenant["reason"],
+        )
+        self._record_memory_guard_notice(notice)
+        return notice
 
     def _ensure_context_vars(self) -> None:
         """Initialize per-instance contextvars for legacy ``__new__`` test doubles."""
@@ -612,38 +720,66 @@ class MemoryManager:
         user_id: str | None | object = _UNSET_OWNER,
         workspace_id: str | None | object = _UNSET_OWNER,
         focus_terms: list[str] | None = None,
+        session: object | None = None,
     ) -> None:
+        from ..core.feature_flags import is_enabled as _ff_enabled
+
         self._current_session_id = session_id
+        if session is not None:
+            self._current_session_obj = session
         if user_id is not _UNSET_OWNER:
             self._current_user_id = str(user_id).strip() if user_id else "anonymous"
         if workspace_id is not _UNSET_OWNER:
             self._current_workspace_id = str(workspace_id).strip() if workspace_id else "default"
+        tenant = self._classify_tenant_context(
+            session_id=session_id,
+            user_id=self._current_user_id,
+            workspace_id=self._current_workspace_id,
+            session=session,
+        )
+        tenant_guard_enabled = _ff_enabled("memory_tenant_guard_v1")
+        register_session_tenant = (
+            tenant["register_session_tenant"] if tenant_guard_enabled else True
+        )
+        tenant_trusted = tenant["tenant_trusted"] if tenant_guard_enabled else True
         # v4：把 session_id → (user_id, workspace_id) 的映射写进 session_tenants 表，
         # 让凌晨 LifecycleManager 批处理时可以反查每条 conversation_turn 到底
         # 属于哪个租户，而不是无脑落到 ContextVar 默认值 default/default。
         if session_id:
             with contextlib.suppress(Exception):
-                self.store.upsert_session_tenant(
-                    session_id,
-                    self._current_user_id or "default",
-                    self._current_workspace_id or "default",
-                )
+                if register_session_tenant:
+                    self.store.upsert_session_tenant(
+                        session_id,
+                        self._current_user_id or "default",
+                        self._current_workspace_id or "default",
+                    )
+                else:
+                    self.store.delete_session_tenant(session_id)
         # P1-5：每次切换会话时显式记录当前 (user_id, workspace_id) 范围，
         # 让运维能从日志直接看出"本会话能看见的长期记忆来自哪个租户"，
         # 排查跨用户串扰时不必再去翻代码或 DB。
         # 同时 user_id 仍为默认 "default" 时降级为 warning：在多用户 IM 通道下
         # 这往往意味着上游忘了把真实 OpenID 传下来，会导致所有人共用同一份长期记忆。
-        if self._current_user_id in ("default", "anonymous", ""):
+        if not tenant_trusted:
             logger.warning(
-                "[Memory] start_session(%s) using fallback user_id=%r workspace_id=%r — "
-                "long-term memories will be shared across all 'default' callers; "
-                "upstream channel/API entry should pass a real user_id to enforce tenant isolation.",
-                session_id, self._current_user_id, self._current_workspace_id,
+                "[Memory] start_session(%s) tenant_source=%s channel=%s user_id=%r "
+                "workspace_id=%r tenant_trusted=%s — %s",
+                session_id,
+                tenant["source"],
+                tenant["channel"],
+                tenant["user_id"],
+                tenant["workspace_id"],
+                tenant_trusted,
+                tenant["reason"] or "unsafe tenant fallback",
             )
         else:
             logger.info(
-                "[Memory] start_session(%s) tenant=(user=%s workspace=%s)",
-                session_id, self._current_user_id, self._current_workspace_id,
+                "[Memory] start_session(%s) tenant_source=%s channel=%s tenant=(user=%s workspace=%s)",
+                session_id,
+                tenant["source"],
+                tenant["channel"],
+                tenant["user_id"],
+                tenant["workspace_id"],
             )
         self._session_turns = []
         self._recent_messages = []
@@ -822,6 +958,13 @@ class MemoryManager:
         else:
             write_user = user_id or self._current_user_id or "default"
         write_workspace = workspace_id or self._current_workspace_id or "default"
+        guard_notice = self._guard_long_term_memory_write(
+            scope=write_scope,
+            user_id=write_user,
+            workspace_id=write_workspace,
+        )
+        if guard_notice:
+            return ""
         memory.scope = write_scope
         memory.scope_owner = write_owner
         memory.user_id = write_user
@@ -1758,6 +1901,13 @@ class MemoryManager:
         else:
             user_id = user_id or self._current_user_id or "default"
         workspace_id = workspace_id or self._current_workspace_id or "default"
+        guard_notice = self._guard_long_term_memory_write(
+            scope=scope,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if guard_notice:
+            return ""
         memory.scope = scope
         memory.scope_owner = scope_owner
         memory.user_id = user_id
@@ -2104,6 +2254,24 @@ class MemoryManager:
     def attach_session_context(self, session: object | None) -> None:
         """Attach current Session object so snapshots can be persisted with SessionContext."""
         self._current_session_obj = session
+        tenant = self._classify_tenant_context(
+            session_id=self._current_session_id or "",
+            user_id=self._current_user_id,
+            workspace_id=self._current_workspace_id,
+            session=session,
+        )
+        if session is not None and hasattr(session, "set_metadata"):
+            with contextlib.suppress(Exception):
+                session.set_metadata(
+                    "_memory_tenant_context",
+                    {
+                        "channel": tenant["channel"],
+                        "user_id": tenant["user_id"],
+                        "workspace_id": tenant["workspace_id"],
+                        "tenant_trusted": tenant["tenant_trusted"],
+                        "source": tenant["source"],
+                    },
+                )
         context = getattr(session, "context", None)
         snapshot = getattr(context, "precompact_snapshot", None)
         if isinstance(snapshot, dict) and snapshot.get("facts"):

@@ -10,14 +10,26 @@ OpenAkita 日志系统
 """
 
 from .cleaner import LogCleaner
-from .config import get_logger, setup_logging
+from .config import (
+    add_console_suppression_filter,
+    get_logger,
+    quiet_logger_family_on_console,
+    remove_named_logger_console_handlers,
+    set_console_log_level,
+    set_named_logger_level,
+    setup_logging,
+)
 from .session_buffer import SessionLogBuffer, get_session_log_buffer
 
 __all__ = [
     "setup_logging",
+    "add_console_suppression_filter",
+    "set_console_log_level",
+    "quiet_logger_family_on_console",
+    "remove_named_logger_console_handlers",
+    "set_named_logger_level",
     "get_logger",
     "LogCleaner",
     "SessionLogBuffer",
     "get_session_log_buffer",
 ]
-

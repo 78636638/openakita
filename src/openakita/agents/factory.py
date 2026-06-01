@@ -9,6 +9,7 @@ Pool key 格式: ``{session_id}::{profile_id}``
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -650,7 +651,28 @@ class AgentInstancePool:
                 await self._reaper_task
             except asyncio.CancelledError:
                 pass
+        entries = list(self._pool.values())
         self._pool.clear()
+        self._create_locks.clear()
+        shutdown_tasks = []
+        seen_agents: set[int] = set()
+        for entry in entries:
+            agent = getattr(entry, "agent", None)
+            if agent is None or id(agent) in seen_agents or not hasattr(agent, "shutdown"):
+                continue
+            seen_agents.add(id(agent))
+            try:
+                maybe_awaitable = agent.shutdown()
+            except Exception as exc:
+                logger.warning("Agent shutdown scheduling failed during pool stop: %s", exc)
+                continue
+            if inspect.isawaitable(maybe_awaitable):
+                shutdown_tasks.append(maybe_awaitable)
+        if shutdown_tasks:
+            results = await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("Agent shutdown error during pool stop: %s", result)
         logger.info("AgentInstancePool stopped")
 
     def notify_skills_changed(self) -> None:

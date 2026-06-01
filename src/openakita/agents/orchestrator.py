@@ -13,6 +13,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -468,6 +469,8 @@ class AgentOrchestrator:
         from_agent: str | None = None,
         isolated_browser: Any = None,
         pre_state_key: str | None = None,
+        tool_filter: list[str] | None = None,
+        progress_event_sink: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> str:
         """Dispatch a message to a specific agent with progress-aware timeout."""
         if depth >= MAX_DELEGATION_DEPTH:
@@ -509,6 +512,8 @@ class AgentOrchestrator:
                 depth=depth,
                 isolated_browser=isolated_browser,
                 pre_state_key=pre_state_key,
+                tool_filter=tool_filter,
+                progress_event_sink=progress_event_sink,
             )
             elapsed_ms = (time.monotonic() - start) * 1000
             health.successful += 1
@@ -635,6 +640,8 @@ class AgentOrchestrator:
         depth: int = 0,
         isolated_browser: Any = None,
         pre_state_key: str | None = None,
+        tool_filter: list[str] | None = None,
+        progress_event_sink: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> str:
         """Run an agent with progress-aware timeout instead of a hard wall-clock limit.
 
@@ -668,6 +675,18 @@ class AgentOrchestrator:
             )
 
         agent = await self._pool.get_or_create(session.id, profile)
+
+        # Inject tool_filter for sub-task execution so the agent loads only
+        # the required tools instead of the full toolset.
+        if tool_filter:
+            agent._current_sub_task = {
+                "required_tools": tool_filter,
+                "description": message,
+            }
+            logger.info(
+                f"[Orchestrator] Agent {agent_profile_id} tool_filter injected: "
+                f"{tool_filter}"
+            )
 
         # Per-profile max_turns override → propagated to reasoning engine
         _max_turns_override: int | None = getattr(profile, "max_turns", None)
@@ -715,6 +734,12 @@ class AgentOrchestrator:
             "name": existing_state.get("name") or profile.get_display_name(),
             "icon": existing_state.get("icon") or profile.icon or "🤖",
         }
+        await self._emit_progress_event(
+            progress_event_sink,
+            state_key,
+            "starting",
+            self._sub_agent_states[state_key],
+        )
 
         try:
             while not task.done():
@@ -787,6 +812,12 @@ class AgentOrchestrator:
                 self._broadcast_sub_state_change(
                     state_key, "running", self._sub_agent_states[state_key]
                 )
+                await self._emit_progress_event(
+                    progress_event_sink,
+                    state_key,
+                    "running",
+                    self._sub_agent_states[state_key],
+                )
 
                 if idle_timeout > 0 and idle_s >= idle_timeout:
                     logger.warning(
@@ -802,9 +833,21 @@ class AgentOrchestrator:
                     except (asyncio.CancelledError, Exception):
                         pass
                     self._update_sub_state(state_key, "timeout", elapsed)
+                    await self._emit_progress_event(
+                        progress_event_sink,
+                        state_key,
+                        "timeout",
+                        self._sub_agent_states.get(state_key),
+                    )
                     raise TimeoutError()
 
             self._update_sub_state(state_key, "completed", time.monotonic() - start)
+            await self._emit_progress_event(
+                progress_event_sink,
+                state_key,
+                "completed",
+                self._sub_agent_states.get(state_key),
+            )
             return task.result()
         except asyncio.CancelledError:
             if not task.done():
@@ -814,7 +857,47 @@ class AgentOrchestrator:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._update_sub_state(state_key, "cancelled", time.monotonic() - start)
+            await self._emit_progress_event(
+                progress_event_sink,
+                state_key,
+                "cancelled",
+                self._sub_agent_states.get(state_key),
+            )
             raise
+
+    @staticmethod
+    async def _emit_progress_event(
+        sink: Callable[[dict[str, Any]], Awaitable[None] | None] | None,
+        state_key: str,
+        status: str,
+        state_entry: dict[str, Any] | None,
+    ) -> None:
+        if sink is None or not isinstance(state_entry, dict):
+            return
+        payload = {
+            "type": "sub_agent_state",
+            "state_key": state_key,
+            "agent_id": state_entry.get("agent_id", ""),
+            "profile_id": state_entry.get("profile_id", ""),
+            "session_id": state_entry.get("session_id", ""),
+            "chat_id": state_entry.get("chat_id", ""),
+            "name": state_entry.get("name", ""),
+            "icon": state_entry.get("icon", ""),
+            "status": status,
+            "iteration": state_entry.get("iteration", 0),
+            "tools_executed": list(state_entry.get("tools_executed", []) or []),
+            "tools_total": state_entry.get("tools_total", 0),
+            "elapsed_s": state_entry.get("elapsed_s", 0),
+            "last_progress_s": state_entry.get("last_progress_s", 0),
+            "current_tool_summary": state_entry.get("current_tool_summary", ""),
+            "tokens_used": state_entry.get("tokens_used", 0),
+        }
+        try:
+            maybe_result = sink(payload)
+            if asyncio.iscoroutine(maybe_result):
+                await maybe_result
+        except Exception:
+            logger.debug("[Orchestrator] Failed to emit progress event", exc_info=True)
 
     def _update_sub_state(self, key: str, status: str, elapsed: float) -> None:
         """Update a sub-agent's state and schedule cleanup for terminal states.
@@ -1277,6 +1360,9 @@ class AgentOrchestrator:
         depth: int = 0,
         reason: str = "",
         isolated_browser: Any = None,
+        context: str = "",
+        tool_filter: list[str] | None = None,
+        progress_event_sink: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> str:
         """
         Delegate work from one agent to another.
@@ -1346,6 +1432,12 @@ class AgentOrchestrator:
                 session.context.handoff_events = session.context.handoff_events[
                     -_MAX_HANDOFF_EVENTS:
                 ]
+        # Inject tool_filter into agent before dispatch if provided
+        if tool_filter:
+            logger.info(
+                f"[Orchestrator] Delegation with tool_filter: {tool_filter}"
+            )
+
         return await self._dispatch(
             session,
             message,
@@ -1354,6 +1446,8 @@ class AgentOrchestrator:
             from_agent=from_agent,
             isolated_browser=isolated_browser,
             pre_state_key=state_key,
+            tool_filter=tool_filter,
+            progress_event_sink=progress_event_sink,
         )
 
     # ------------------------------------------------------------------

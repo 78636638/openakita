@@ -188,6 +188,9 @@ def strip_tool_simulation_text(text: str) -> str:
 
 _LEADING_TIMESTAMP_RE = re.compile(r"^\s*\[\d{1,2}:\d{2}\]\s*")
 
+_DELIVERY_SUCCESS_STATUSES = {"delivered", "skipped", "relayed", "submitted"}
+_DELIVERY_FAILED_STATUSES = {"failed", "error"}
+
 
 # 完整字符串内部 trace marker 清理用的正则。
 # 匹配："消息开头" 或 "段落边界（一个或多个 \n + 可选空白）" 之后的
@@ -297,6 +300,77 @@ def clean_llm_response(text: str) -> str:
     cleaned = _LEADING_TIMESTAMP_RE.sub("", cleaned)
 
     return cleaned.strip()
+
+
+def _resolve_delivery_state(receipt: dict[str, Any]) -> str:
+    state = str(receipt.get("delivery_state") or "").strip().lower()
+    if state in {"delivered", "local_only", "failed"}:
+        return state
+
+    status = str(receipt.get("status") or "").strip().lower()
+    if status in _DELIVERY_FAILED_STATUSES:
+        return "failed"
+    if str(receipt.get("channel") or "").strip().lower() == "desktop" and status in _DELIVERY_SUCCESS_STATUSES:
+        return "local_only"
+    if status in _DELIVERY_SUCCESS_STATUSES:
+        return "delivered"
+    return "failed"
+
+
+def _looks_like_external_delivery_request(text: str) -> bool:
+    normalized = (text or "").lower()
+    if not normalized:
+        return False
+    channel_markers = (
+        "飞书",
+        "feishu",
+        "telegram",
+        "微信",
+        "wecom",
+        "钉钉",
+        "dingtalk",
+        "qq",
+        "群",
+        "私聊",
+        "消息",
+    )
+    delivery_markers = (
+        "推送",
+        "发送",
+        "发给",
+        "发到",
+        "交付",
+        "上传",
+        "回复",
+        "二维码",
+        "附件",
+        "图片",
+        "文件",
+        "截图",
+    )
+    return any(marker in normalized for marker in channel_markers) and any(
+        marker in normalized for marker in delivery_markers
+    )
+
+
+def _looks_like_external_delivery_claim(text: str) -> bool:
+    normalized = (text or "").lower()
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "已发送",
+            "已推送",
+            "已发给",
+            "已发到",
+            "已交付",
+            "已上传",
+            "请查收",
+            "附件如下",
+            "图片如下",
+        )
+    )
 
 
 # ==================== 意图声明解析 ====================
@@ -553,6 +627,8 @@ class ResponseHandler:
         """
         self._brain = brain
         self._memory_manager = memory_manager
+        self._last_task_verification_summary: dict[str, Any] | None = None
+        self._current_tool_metadata_summary: dict[str, Any] | None = None
 
     # 系统/组织自动注入的「被动收到」类元指令前缀（17 项）。命中其中任何
     # 一个意味着「user_request」实际上不是真正用户输入，而是 OrgRuntime /
@@ -573,6 +649,134 @@ class ResponseHandler:
         # 该函数同时被 runtime / reasoning_engine 直接 import，避免依赖
         # ResponseHandler 实例属性导致的 stale 信号问题。
         return request_expects_artifact(user_request, has_produced_files=has_produced_files)
+
+    def _set_last_task_verification_summary(
+        self,
+        *,
+        status: str,
+        decision_source: str,
+        reason: str,
+        validator: str = "",
+        expects_artifact: bool | None = None,
+        executed_tools: list[str] | None = None,
+        delivery_receipts: list[dict] | None = None,
+        plan_fail_reason: str = "",
+    ) -> None:
+        receipts = list(delivery_receipts or [])
+        delivery_state_counts = {
+            "delivered": 0,
+            "local_only": 0,
+            "failed": 0,
+        }
+        for receipt in receipts:
+            state = str(receipt.get("delivery_state") or "").strip().lower()
+            if not state:
+                receipt_status = str(receipt.get("status") or "").strip().lower()
+                if receipt_status in {"failed", "error"}:
+                    state = "failed"
+                elif receipt_status == "delivered" and receipt.get("channel") == "desktop":
+                    state = "local_only"
+                elif receipt_status in {"delivered", "skipped", "relayed", "submitted"}:
+                    state = "delivered"
+                else:
+                    state = "failed"
+            if state not in delivery_state_counts:
+                state = "failed"
+            delivery_state_counts[state] += 1
+        successful_receipts = sum(
+            1 for receipt in receipts if receipt.get("status") in {"delivered", "skipped", "relayed"}
+        )
+        tool_metadata_summary = dict(self._current_tool_metadata_summary or {})
+        self._last_task_verification_summary = {
+            "status": status,
+            "decision_source": decision_source,
+            "reason": reason[:240],
+            "validator": validator,
+            "expects_artifact": expects_artifact,
+            "executed_tools": list(executed_tools or []),
+            "executed_tool_count": len(list(executed_tools or [])),
+            "delivery_receipt_count": len(receipts),
+            "successful_delivery_receipt_count": successful_receipts,
+            "failed_delivery_receipt_count": delivery_state_counts["failed"],
+            "delivered_delivery_receipt_count": delivery_state_counts["delivered"],
+            "local_only_delivery_receipt_count": delivery_state_counts["local_only"],
+            "delivery_state_counts": delivery_state_counts,
+            "plan_fail_reason": plan_fail_reason[:240] if plan_fail_reason else "",
+            "tool_metadata_summary": tool_metadata_summary,
+        }
+
+    @staticmethod
+    def _summarize_tool_metadata(
+        tool_results: list[dict[str, Any]] | None,
+        delivery_receipts: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        results = [item for item in (tool_results or []) if isinstance(item, dict)]
+        receipts = [item for item in (delivery_receipts or []) if isinstance(item, dict)]
+
+        tool_names: list[str] = []
+        delivery_tools: list[str] = []
+        error_tool_count = 0
+        delivery_receipt_count = 0
+        delivery_state_counts = {"delivered": 0, "local_only": 0, "failed": 0}
+        has_delivery_metadata = False
+
+        def _merge_delivery_state_summary(summary: dict[str, Any]) -> None:
+            nonlocal has_delivery_metadata
+            has_delivery_metadata = True
+            for key in ("delivered", "local_only", "failed"):
+                try:
+                    delivery_state_counts[key] += int(summary.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        for result in results:
+            tool_name = str(result.get("tool_name") or result.get("name") or "").strip()
+            if tool_name and tool_name not in tool_names:
+                tool_names.append(tool_name)
+            if result.get("is_error"):
+                error_tool_count += 1
+            if isinstance(result.get("_delivery_state_summary"), dict):
+                _merge_delivery_state_summary(dict(result["_delivery_state_summary"]))
+            result_receipts = result.get("_delivery_receipts")
+            if isinstance(result_receipts, list):
+                has_delivery_metadata = True
+                delivery_receipt_count += len(result_receipts)
+                if tool_name and tool_name not in delivery_tools:
+                    delivery_tools.append(tool_name)
+
+        if receipts:
+            has_delivery_metadata = True
+            if delivery_receipt_count == 0:
+                delivery_receipt_count = len(receipts)
+            for receipt in receipts:
+                state = str(receipt.get("delivery_state") or "").strip().lower()
+                if not state:
+                    status = str(receipt.get("status") or "").strip().lower()
+                    if status in {"failed", "error"}:
+                        state = "failed"
+                    elif status == "delivered" and receipt.get("channel") == "desktop":
+                        state = "local_only"
+                    elif status in {"delivered", "skipped", "relayed", "submitted"}:
+                        state = "delivered"
+                    else:
+                        state = "failed"
+                if state not in delivery_state_counts:
+                    state = "failed"
+                delivery_state_counts[state] += 1
+
+        return {
+            "tool_result_count": len(results),
+            "tool_names": tool_names[:12],
+            "error_tool_count": error_tool_count,
+            "has_delivery_metadata": has_delivery_metadata,
+            "delivery_tools": delivery_tools[:8],
+            "delivery_receipt_count": delivery_receipt_count,
+            "delivery_state_counts": delivery_state_counts,
+        }
+
+    def get_last_task_verification_summary(self) -> dict[str, Any] | None:
+        summary = self._last_task_verification_summary
+        return dict(summary) if isinstance(summary, dict) else None
 
     async def verify_task_completion(
         self,
@@ -603,8 +807,23 @@ class ResponseHandler:
         Returns:
             True 如果任务已完成
         """
+        self._last_task_verification_summary = None
+        tool_results = tool_results or []
+        delivery_receipts = delivery_receipts or []
+        self._current_tool_metadata_summary = self._summarize_tool_metadata(
+            tool_results,
+            delivery_receipts,
+        )
+
         if bypass:
             logger.info("[TaskVerify] Bypassed (supervisor intervention active)")
+            self._set_last_task_verification_summary(
+                status="completed",
+                decision_source="bypass",
+                reason="Supervisor intervention active",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+            )
             return True
 
         # 内层兜底：当 user_request 命中「被动通知」类前缀（17 项，
@@ -622,12 +841,18 @@ class ResponseHandler:
                 "[TaskVerify] Bypassed (passive-notification prefix matched: %r)",
                 preview,
             )
+            self._set_last_task_verification_summary(
+                status="completed",
+                decision_source="system_prefix_bypass",
+                reason=f"Passive-notification prefix matched: {preview}",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+            )
             return True
-
-        delivery_receipts = delivery_receipts or []
 
         # === Deterministic Validation (Agent Harness) ===
         plan_fail_reason = ""
+        expects_artifact = False
         try:
             from .validators import ValidationContext, ValidationResult, create_default_registry
 
@@ -648,13 +873,42 @@ class ResponseHandler:
                 for output in report.outputs:
                     if output.result == ValidationResult.PASS and output.name in (
                         "ArtifactValidator",
+                        "CompletionEvidenceValidator",
                         "CompletePlanValidator",
                         "OrgDelegationValidator",
                     ):
                         logger.info(
                             f"[TaskVerify] Deterministic PASS: {output.name} — {output.reason}"
                         )
+                        self._set_last_task_verification_summary(
+                            status="completed",
+                            decision_source="deterministic_pass",
+                            reason=output.reason,
+                            validator=output.name,
+                            executed_tools=executed_tools,
+                            delivery_receipts=delivery_receipts,
+                            plan_fail_reason=plan_fail_reason,
+                        )
                         return True
+
+                for output in report.outputs:
+                    if (
+                        output.result == ValidationResult.FAIL
+                        and output.name == "CompletionEvidenceValidator"
+                    ):
+                        logger.info(
+                            f"[TaskVerify] Deterministic FAIL: {output.name} — {output.reason}"
+                        )
+                        self._set_last_task_verification_summary(
+                            status="incomplete",
+                            decision_source="deterministic_fail",
+                            reason=output.reason,
+                            validator=output.name,
+                            executed_tools=executed_tools,
+                            delivery_receipts=delivery_receipts,
+                            plan_fail_reason=plan_fail_reason,
+                        )
+                        return False
 
                 for output in report.outputs:
                     if output.result == ValidationResult.FAIL and output.name == "PlanValidator":
@@ -699,16 +953,24 @@ class ResponseHandler:
             tool_results_list = tool_results or []
             org_submit_ok = "org_submit_deliverable" in executed_set
             deliver_artifacts_ok = "deliver_artifacts" in executed_set
-            successful_receipts = [
+            delivered_receipts = [
                 r
                 for r in delivery_receipts
-                if r.get("status") in {"delivered", "skipped", "relayed"}
+                if _resolve_delivery_state(r) == "delivered"
+            ]
+            local_only_receipts = [
+                r
+                for r in delivery_receipts
+                if _resolve_delivery_state(r) == "local_only"
             ]
             failed_receipts = [
                 r
                 for r in delivery_receipts
-                if r.get("status") not in {"delivered", "skipped", "relayed"}
+                if _resolve_delivery_state(r) == "failed"
             ]
+            usable_receipts = delivered_receipts + local_only_receipts
+            is_external_delivery = _looks_like_external_delivery_request(user_request)
+            makes_external_delivery_claim = _looks_like_external_delivery_claim(assistant_response)
 
             if org_submit_ok or deliver_artifacts_ok:
                 # 找出 submit_deliverable 工具调用对应的成功结果
@@ -734,15 +996,15 @@ class ResponseHandler:
                         if isinstance(files, list):
                             attachments_count = max(attachments_count, len(files))
 
-                if successful_receipts:
-                    attachments_count = max(attachments_count, len(successful_receipts))
+                if usable_receipts:
+                    attachments_count = max(attachments_count, len(usable_receipts))
 
                 # 兜底：tool_results 里拿不到详细参数（旧调用路径），退一步只看
                 # 工具是否被执行 + delivery_receipts 是否非空（说明附件已发送）
                 if not submit_ok_run and (org_submit_ok or deliver_artifacts_ok):
                     submit_ok_run = True
-                    if successful_receipts:
-                        attachments_count = max(attachments_count, len(successful_receipts))
+                    if usable_receipts:
+                        attachments_count = max(attachments_count, len(usable_receipts))
 
                 # 阈值分两档：
                 #   - expects_artifact=True：必须 attachments_count >= 1，纯文本不算
@@ -759,6 +1021,35 @@ class ResponseHandler:
                     logger.info(
                         "[TaskVerify] artifact delivery returned failed receipts, INCOMPLETE"
                     )
+                    self._set_last_task_verification_summary(
+                        status="incomplete",
+                        decision_source="trust_but_verify",
+                        reason="artifact delivery returned failed receipts",
+                        executed_tools=executed_tools,
+                        delivery_receipts=delivery_receipts,
+                        expects_artifact=expects_artifact,
+                        plan_fail_reason=plan_fail_reason,
+                    )
+                    return False
+                if (
+                    deliver_artifacts_ok
+                    and local_only_receipts
+                    and not delivered_receipts
+                    and (is_external_delivery or makes_external_delivery_claim)
+                ):
+                    logger.info(
+                        "[TaskVerify] artifact available locally only, but external delivery "
+                        "was requested/claimed, INCOMPLETE"
+                    )
+                    self._set_last_task_verification_summary(
+                        status="incomplete",
+                        decision_source="trust_but_verify",
+                        reason="artifact available locally only; external delivery not verified",
+                        executed_tools=executed_tools,
+                        delivery_receipts=delivery_receipts,
+                        expects_artifact=expects_artifact,
+                        plan_fail_reason=plan_fail_reason,
+                    )
                     return False
                 if pass_ok:
                     logger.info(
@@ -767,11 +1058,32 @@ class ResponseHandler:
                         "expects_artifact=%s",
                         deliverable_len, attachments_count, expects_artifact,
                     )
+                    self._set_last_task_verification_summary(
+                        status="completed",
+                        decision_source="trust_but_verify",
+                        reason=(
+                            f"submit_deliverable executed with deliverable_len={deliverable_len}, "
+                            f"attachments={attachments_count}"
+                        ),
+                        executed_tools=executed_tools,
+                        delivery_receipts=delivery_receipts,
+                        expects_artifact=expects_artifact,
+                        plan_fail_reason=plan_fail_reason,
+                    )
                     return True
                 if expects_artifact and deliver_artifacts_ok and delivery_receipts:
                     logger.info(
                         "[TaskVerify] artifact delivery attempted but no successful receipt, "
                         "INCOMPLETE"
+                    )
+                    self._set_last_task_verification_summary(
+                        status="incomplete",
+                        decision_source="trust_but_verify",
+                        reason="artifact delivery attempted but no successful receipt",
+                        executed_tools=executed_tools,
+                        delivery_receipts=delivery_receipts,
+                        expects_artifact=expects_artifact,
+                        plan_fail_reason=plan_fail_reason,
                     )
                     return False
                 if submit_ok_run:
@@ -810,6 +1122,15 @@ class ResponseHandler:
             and "deliver_artifacts" not in (executed_tools or [])
         ):
             logger.info("[TaskVerify] delivery claim without receipts, INCOMPLETE")
+            self._set_last_task_verification_summary(
+                status="incomplete",
+                decision_source="claim_without_evidence",
+                reason="delivery claim without receipts or delivery tool evidence",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+                expects_artifact=expects_artifact,
+                plan_fail_reason=plan_fail_reason,
+            )
             return False
 
         if (
@@ -819,6 +1140,15 @@ class ResponseHandler:
         ):
             logger.info(
                 "[TaskVerify] artifact requested but no delivery receipts/tools, INCOMPLETE"
+            )
+            self._set_last_task_verification_summary(
+                status="incomplete",
+                decision_source="artifact_missing",
+                reason="artifact requested but no delivery receipts/tools",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+                expects_artifact=expects_artifact,
+                plan_fail_reason=plan_fail_reason,
             )
             return False
 
@@ -840,6 +1170,15 @@ class ResponseHandler:
             and "deliver_artifacts" not in (executed_tools or [])
         ):
             logger.info("[TaskVerify] user-visible UI claim without delivery/evidence, INCOMPLETE")
+            self._set_last_task_verification_summary(
+                status="incomplete",
+                decision_source="ui_claim_without_evidence",
+                reason="user-visible UI claim without delivery or observable evidence",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+                expects_artifact=expects_artifact,
+                plan_fail_reason=plan_fail_reason,
+            )
             return False
 
         # LLM 判断
@@ -940,6 +1279,15 @@ NEXT: 建议的下一步"""
             logger.info(
                 f"[TaskVerify] request={user_request[:50]}... result={'COMPLETED' if is_completed else 'INCOMPLETE'}"
             )
+            self._set_last_task_verification_summary(
+                status="completed" if is_completed else "incomplete",
+                decision_source="llm_verify",
+                reason="LLM task verification completed",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+                expects_artifact=expects_artifact,
+                plan_fail_reason=plan_fail_reason,
+            )
 
             # Decision Trace: 记录验证决策
             try:
@@ -958,6 +1306,15 @@ NEXT: 建议的下一步"""
 
         except Exception as e:
             logger.warning(f"[TaskVerify] Failed to verify: {e}, assuming INCOMPLETE")
+            self._set_last_task_verification_summary(
+                status="incomplete",
+                decision_source="llm_error",
+                reason=f"verification failed: {e}",
+                executed_tools=executed_tools,
+                delivery_receipts=delivery_receipts,
+                expects_artifact=expects_artifact,
+                plan_fail_reason=plan_fail_reason,
+            )
             return False
 
     async def do_task_retrospect(self, task_monitor: Any) -> str:
@@ -1084,4 +1441,3 @@ NEXT: 建议的下一步"""
                                 )
                                 return result
         return ""
-

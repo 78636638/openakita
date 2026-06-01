@@ -63,6 +63,7 @@ from .opencli import OPENCLI_TOOLS
 from .org_setup import ORG_SETUP_TOOLS
 from .persona import PERSONA_TOOLS
 from .plan import PLAN_TOOLS
+from .planner import PLANNER_TOOLS
 from .plugins import PLUGIN_TOOLS
 from .powershell import POWERSHELL_TOOLS
 from .profile import PROFILE_TOOLS
@@ -98,6 +99,7 @@ BASE_TOOLS = (
     + MODE_TOOLS
     + NOTEBOOK_TOOLS
     + PERSONA_TOOLS
+    + PLANNER_TOOLS
     + STICKER_TOOLS
     + CONFIG_TOOLS
     + AGENT_PACKAGE_TOOLS
@@ -166,6 +168,7 @@ __all__ = [
     "SYSTEM_TOOLS",
     "MCP_TOOLS",
     "PLAN_TOOLS",
+    "PLANNER_TOOLS",
     "WEB_FETCH_TOOLS",
     "WEB_SEARCH_TOOLS",
     "PERSONA_TOOLS",

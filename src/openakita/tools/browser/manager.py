@@ -8,6 +8,7 @@ BrowserManager - 浏览器生命周期管理
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import platform
@@ -450,10 +451,17 @@ class BrowserManager:
                 except Exception as e:
                     msg = f"{strategy.value}: {e}"
                     self._startup_errors.append(msg)
-                    logger.warning(
-                        f"[Browser] Strategy {strategy.value} failed: {e}",
-                        exc_info=True,
-                    )
+                    if self._should_downgrade_startup_exception(strategy, e):
+                        logger.info(
+                            "[Browser] Strategy %s unavailable (%s), trying next strategy",
+                            strategy.value,
+                            e,
+                        )
+                    else:
+                        logger.warning(
+                            f"[Browser] Strategy {strategy.value} failed: {e}",
+                            exc_info=True,
+                        )
                     if self._is_driver_pipe_broken(e) or await self._is_driver_dead():
                         logger.warning(
                             "[Browser] Playwright driver died/pipe broken, "
@@ -623,6 +631,41 @@ class BrowserManager:
         self._cdp_url = None
         logger.info("[Browser] State reset")
 
+    async def cleanup_disconnected_state(self) -> None:
+        """尽最大可能清理断连后的本地资源，再重置状态。
+
+        场景：Playwright driver / browser / page 已断开，直接使用 ``stop()``
+        往往会在关闭路径再次抛错；但如果只 ``reset_state()``，则可能把
+        page/context/browser/playwright 的引用直接丢掉，导致底层资源延迟释放。
+
+        这里采用“最佳努力关闭 + 最终 reset_state”策略：
+        - 尽量关闭 page/context/browser
+        - 无论关闭过程中是否报错，最后都停止 playwright driver
+        - 最终统一把管理器状态恢复为 IDLE
+        """
+        self.state = BrowserState.STOPPING
+
+        page = self._page
+        context = self._context
+        browser = self._browser
+
+        try:
+            if page is not None:
+                with contextlib.suppress(Exception):
+                    await page.close()
+
+            if context is not None:
+                with contextlib.suppress(Exception):
+                    await context.close()
+
+            if browser is not None and not self.using_user_chrome:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+        finally:
+            await self._cleanup_playwright()
+            await self.reset_state()
+            logger.info("[Browser] Disconnected browser resources cleaned up")
+
     # ── 内部 ────────────────────────────────────────────
 
     def _setup_browsers_path(self) -> None:
@@ -727,6 +770,19 @@ class BrowserManager:
         self.visible = True
         logger.info(f"[Browser] Connected to running Chrome (tabs: {len(self._context.pages)})")
         return True
+
+    @staticmethod
+    def _should_downgrade_startup_exception(strategy: StartupStrategy, exc: Exception) -> bool:
+        if strategy != StartupStrategy.CDP_CONNECT:
+            return False
+        text = str(exc).lower()
+        markers = (
+            "all connection attempts failed",
+            "connection refused",
+            "failed to establish a new connection",
+            "connecterror",
+        )
+        return any(marker in text for marker in markers)
 
     def _build_launch_args(self) -> list[str]:
         """构建 Chromium 启动参数列表。"""

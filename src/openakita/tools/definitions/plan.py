@@ -29,7 +29,9 @@ PLAN_TOOLS = [
             "- Trivial tasks with no organizational benefit\n"
             "- Purely conversational/informational requests\n\n"
             "IMPORTANT: Mark steps complete IMMEDIATELY after finishing each one. "
-            "Only ONE step should be in_progress at a time."
+            "Only ONE step should be in_progress at a time. "
+            "The system will append a final review step automatically, and complete_todo "
+            "will be rejected unless that review explicitly passes."
         ),
         "detail": """创建任务执行计划。
 
@@ -39,7 +41,7 @@ PLAN_TOOLS = [
 - 涉及多个工具协作
 
 **使用流程**：
-1. create_todo → 2. 执行步骤 → 3. update_todo_step → 4. ... → 5. complete_todo
+1. create_todo → 2. 执行步骤 → 3. update_todo_step → 4. 执行最终审查 → 5. complete_todo
 
 **步骤字段说明**：
 - `id` + `description`: 必填
@@ -93,10 +95,15 @@ PLAN_TOOLS = [
     {
         "name": "update_todo_step",
         "category": "Todo",
-        "description": "Update the status of a todo step. MUST call after completing each step to track progress.",
+        "description": (
+            "Update the status of a todo step. MUST call after completing each step to track "
+            "progress, including the final review step."
+        ),
         "detail": """更新计划中某个步骤的状态。
 
 **每完成一步必须调用此工具！**
+包括系统自动追加的最终“审查”步骤。审查结果必须写明是否通过、证据是什么、
+若未通过缺什么。
 
 **状态值**：
 - pending: 待执行
@@ -138,10 +145,13 @@ PLAN_TOOLS = [
     {
         "name": "complete_todo",
         "category": "Todo",
-        "description": "Mark the todo as completed and generate a summary report. Call when ALL steps are done.",
+        "description": (
+            "Mark the todo as completed and generate a summary report. Call only after ALL "
+            "steps are done and the final review step has explicitly passed."
+        ),
         "detail": """标记计划完成，生成最终报告。
 
-**在所有步骤完成后调用**
+**仅在所有步骤完成且最终审查明确通过后调用**
 
 **返回**：
 - 执行摘要
@@ -235,4 +245,3 @@ isProject: true
         },
     },
 ]
-

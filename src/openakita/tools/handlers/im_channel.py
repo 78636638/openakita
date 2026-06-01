@@ -94,6 +94,77 @@ class IMChannelHandler:
             return False
 
     @staticmethod
+    def _resolve_delivery_state(receipt: dict[str, Any], *, delivery_mode: str) -> str:
+        """Classify a receipt without changing the legacy ``status`` contract."""
+        status = str(receipt.get("status") or "").strip().lower()
+        if status in {"failed", "error"}:
+            return "failed"
+        if delivery_mode == "desktop":
+            return "local_only"
+        if status in {"delivered", "skipped", "relayed", "submitted"}:
+            return "delivered"
+        return "failed"
+
+    @classmethod
+    def _attach_delivery_state(
+        cls, receipt: dict[str, Any], *, delivery_mode: str
+    ) -> dict[str, Any]:
+        enriched = dict(receipt)
+        enriched["delivery_state"] = cls._resolve_delivery_state(
+            enriched, delivery_mode=delivery_mode
+        )
+        return enriched
+
+    @staticmethod
+    def _summarize_delivery_states(receipts: list[dict[str, Any]]) -> dict[str, int]:
+        summary = {"delivered": 0, "local_only": 0, "failed": 0}
+        for receipt in receipts:
+            state = str(receipt.get("delivery_state") or "").strip().lower()
+            if state not in summary:
+                state = "failed"
+            summary[state] += 1
+        return summary
+
+    def _get_channel_delivery_context(
+        self, adapter: Optional["ChannelAdapter"], channel: Optional[str]
+    ) -> dict[str, Any]:
+        if not adapter:
+            return {}
+
+        snapshot_getter = getattr(adapter, "get_delivery_capability_snapshot", None)
+        if callable(snapshot_getter):
+            try:
+                snapshot = snapshot_getter()
+            except Exception:
+                snapshot = None
+            if isinstance(snapshot, dict):
+                return {
+                    "channel_delivery_degraded": bool(snapshot.get("delivery_degraded")),
+                    "channel_delivery_hint": str(snapshot.get("delivery_hint") or ""),
+                    "channel_delivery_mode": str(snapshot.get("streaming_mode") or ""),
+                    "channel_delivery_reasons": list(snapshot.get("degradation_reasons") or []),
+                }
+
+        if str(channel or "").lower() != "feishu":
+            return {}
+
+        session = getattr(self.agent, "_current_session", None)
+        if not session or not hasattr(session, "get_metadata"):
+            return {}
+        im_env = session.get_metadata("_im_environment") or {}
+        capabilities = im_env.get("capabilities") or []
+        if isinstance(capabilities, list) and "CardKit 流式卡片" not in capabilities:
+            return {
+                "channel_delivery_degraded": True,
+                "channel_delivery_hint": (
+                    "Feishu CardKit 不可用，流式消息已降级；基础文本/文件交付仍可用。"
+                ),
+                "channel_delivery_mode": "patch_message",
+                "channel_delivery_reasons": ["CardKit capability missing in current IM session"],
+            }
+        return {}
+
+    @staticmethod
     def _normalize_artifact_item(item: Any) -> dict | None:
         if isinstance(item, str):
             path = item.strip()
@@ -112,13 +183,50 @@ class IMChannelHandler:
             artifact["path"] = path
 
         if not artifact.get("type") and artifact.get("path"):
-            artifact["type"] = "file"
+            suffix = Path(str(artifact["path"])).suffix.lower()
+            artifact["type"] = (
+                "image"
+                if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+                else "file"
+            )
         if not artifact.get("name"):
             name = artifact.get("filename") or artifact.get("file_name")
             if name:
                 artifact["name"] = name
 
         return artifact
+
+    @classmethod
+    def _normalize_top_level_legacy_artifact(cls, params: dict[str, Any]) -> dict | None:
+        """Convert top-level legacy deliver_artifacts params into a single artifact item."""
+        if not isinstance(params, dict):
+            return None
+
+        path = (
+            params.get("path")
+            or params.get("file_path")
+            or params.get("filepath")
+            or params.get("local_path")
+        )
+        if path in (None, ""):
+            return None
+
+        artifact = {
+            "path": path,
+        }
+        for key in (
+            "type",
+            "caption",
+            "name",
+            "filename",
+            "file_name",
+            "channel",
+            "mime_type",
+        ):
+            value = params.get(key)
+            if value not in (None, ""):
+                artifact[key] = value
+        return cls._normalize_artifact_item(artifact)
 
     @classmethod
     def _normalize_artifacts(cls, raw: Any) -> list[dict]:
@@ -176,6 +284,13 @@ class IMChannelHandler:
                 break
 
         artifacts = cls._normalize_artifacts(raw)
+        if not artifacts:
+            legacy_item = cls._normalize_top_level_legacy_artifact(normalized)
+            if legacy_item is not None:
+                artifacts = [legacy_item]
+                logger.info(
+                    "[deliver_artifacts] normalized top-level legacy file reference into artifacts"
+                )
         normalized["artifacts"] = artifacts
 
         if raw_key == "recipients" and not normalized.get("target_channel"):
@@ -452,6 +567,7 @@ class IMChannelHandler:
                         "请确认该通道已配置、适配器正在运行，且至少有过一次会话。"
                     ),
                     "receipts": [],
+                    "delivery_state_summary": self._summarize_delivery_states([]),
                 },
                 ensure_ascii=False,
             )
@@ -536,7 +652,7 @@ class IMChannelHandler:
                 receipt["error_code"] = "exception"
                 logger.error(f"[CrossChannel] Failed to send artifact to {target_channel}: {e}")
 
-            receipts.append(receipt)
+            receipts.append(self._attach_delivery_state(receipt, delivery_mode="cross_channel"))
 
         ok = (
             all(r.get("status") in ("delivered", "skipped") for r in receipts)
@@ -547,11 +663,13 @@ class IMChannelHandler:
             f"[CrossChannel] deliver_artifacts to {target_channel}: "
             f"{sum(1 for r in receipts if r.get('status') == 'delivered')}/{len(receipts)} delivered"
         )
-        return json.dumps(
-            {"ok": ok, "channel": target_channel, "receipts": receipts},
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload = {
+            "ok": ok,
+            "channel": target_channel,
+            "receipts": receipts,
+            "delivery_state_summary": self._summarize_delivery_states(receipts),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     async def _deliver_artifacts_desktop(self, params: dict) -> str:
         """
@@ -576,22 +694,28 @@ class IMChannelHandler:
 
             if not path_str:
                 receipts.append(
-                    {
-                        "index": idx,
-                        "status": "error",
-                        "error": "missing_path",
-                    }
+                    self._attach_delivery_state(
+                        {
+                            "index": idx,
+                            "status": "error",
+                            "error": "missing_path",
+                        },
+                        delivery_mode="desktop",
+                    )
                 )
                 continue
 
             p = Path(path_str)
             if not p.exists() or not p.is_file():
                 receipts.append(
-                    {
-                        "index": idx,
-                        "status": "error",
-                        "error": f"file_not_found: {path_str}",
-                    }
+                    self._attach_delivery_state(
+                        {
+                            "index": idx,
+                            "status": "error",
+                            "error": f"file_not_found: {path_str}",
+                        },
+                        delivery_mode="desktop",
+                    )
                 )
                 continue
 
@@ -624,17 +748,20 @@ class IMChannelHandler:
             size = resolved.stat().st_size
 
             receipts.append(
-                {
-                    "index": idx,
-                    "status": "delivered",
-                    "type": art_type,
-                    "path": abs_path,
-                    "file_url": file_url,
-                    "caption": caption,
-                    "name": name or p.name,
-                    "size": size,
-                    "channel": "desktop",
-                }
+                self._attach_delivery_state(
+                    {
+                        "index": idx,
+                        "status": "delivered",
+                        "type": art_type,
+                        "path": abs_path,
+                        "file_url": file_url,
+                        "caption": caption,
+                        "name": name or p.name,
+                        "size": size,
+                        "channel": "desktop",
+                    },
+                    delivery_mode="desktop",
+                )
             )
 
         ok = all(r.get("status") == "delivered" for r in receipts) if receipts else False
@@ -642,6 +769,7 @@ class IMChannelHandler:
             "ok": ok,
             "channel": "desktop",
             "receipts": receipts,
+            "delivery_state_summary": self._summarize_delivery_states(receipts),
             "hint": "Desktop mode: files are served via /api/files/ endpoint. "
             "Frontend should display images inline using the file_url.",
         }
@@ -667,6 +795,7 @@ class IMChannelHandler:
                         "error": f"adapter_not_found:{channel}",
                         "error_code": "adapter_not_found",
                         "receipts": [],
+                        "delivery_state_summary": self._summarize_delivery_states([]),
                     },
                     ensure_ascii=False,
                 )
@@ -676,6 +805,7 @@ class IMChannelHandler:
                     "error": "missing_gateway_or_message_context",
                     "error_code": "missing_context",
                     "receipts": [],
+                    "delivery_state_summary": self._summarize_delivery_states([]),
                 },
                 ensure_ascii=False,
             )
@@ -781,7 +911,7 @@ class IMChannelHandler:
             except Exception as e:
                 receipt["error"] = str(e)
                 receipt["error_code"] = "exception"
-            receipts.append(receipt)
+            receipts.append(self._attach_delivery_state(receipt, delivery_mode="im"))
 
             if receipt.get("status") == "delivered" and dedupe_key:
                 dedupe_set.add(dedupe_key)
@@ -798,7 +928,13 @@ class IMChannelHandler:
             if receipts
             else False
         )
-        result_json = json.dumps({"ok": ok, "receipts": receipts}, ensure_ascii=False, indent=2)
+        payload = {
+            "ok": ok,
+            "receipts": receipts,
+            "delivery_state_summary": self._summarize_delivery_states(receipts),
+        }
+        payload.update(self._get_channel_delivery_context(adapter, channel))
+        result_json = json.dumps(payload, ensure_ascii=False, indent=2)
 
         # 进度事件由网关统一发送（节流/合并）
         try:

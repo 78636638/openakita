@@ -40,6 +40,11 @@ from ..types import (
 logger = logging.getLogger(__name__)
 
 
+def _log_bot_info_raw_http_fallback_notice() -> None:
+    """The bot info HTTP fallback is an expected compatibility path."""
+    logger.info("lark_oapi.api.bot module not available, trying raw HTTP fallback...")
+
+
 def _drain_loop_tasks(loop: asyncio.AbstractEventLoop, timeout: float = 3.0) -> None:
     """Cancel all pending tasks on *loop* and run them to completion.
 
@@ -255,8 +260,10 @@ class FeishuAdapter(ChannelAdapter):
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_watchdog_task: asyncio.Task | None = None
         self._ws_restart_count: int = 0
+        self._lifecycle_lock = asyncio.Lock()
         self._bot_open_id: str | None = None
         self._capabilities: list[str] = []
+        self._capability_degradations: list[str] = []
 
         # 消息去重：WebSocket 重连可能导致重复投递
         self._seen_message_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
@@ -357,128 +364,150 @@ class FeishuAdapter(ChannelAdapter):
         会自动启动 WebSocket 长连接（非阻塞模式），以便接收消息。
         SDK 会自动管理 access_token，无需手动刷新。
         """
-        _import_lark()
+        async with self._lifecycle_lock:
+            ws_thread = self._ws_thread
+            if self._running and ws_thread is not None and ws_thread.is_alive():
+                logger.info(
+                    f"Feishu adapter[{self.channel_name}] already running, skip duplicate start"
+                )
+                return
 
-        # 创建客户端
-        log_level = getattr(lark_oapi.LogLevel, self.config.log_level, lark_oapi.LogLevel.INFO)
+            if self._running:
+                logger.warning(
+                    f"Feishu adapter[{self.channel_name}] restart requested while previous state "
+                    "was still marked running; recreating connection state"
+                )
+                if self._ws_watchdog_task is not None:
+                    self._ws_watchdog_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._ws_watchdog_task
+                    self._ws_watchdog_task = None
 
-        sdk_domain = lark_oapi.LARK_DOMAIN if self.config.is_lark else lark_oapi.FEISHU_DOMAIN
-        self._client = (
-            lark_oapi.Client.builder()
-            .app_id(self.config.app_id)
-            .app_secret(self.config.app_secret)
-            .domain(sdk_domain)
-            .log_level(log_level)
-            .build()
-        )
+            _import_lark()
 
-        # 记录主事件循环，用于从 WebSocket 线程投递协程
-        try:
-            self._main_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._main_loop = None
-        logger.info("Feishu adapter: client initialized")
+            # 创建客户端
+            log_level = getattr(lark_oapi.LogLevel, self.config.log_level, lark_oapi.LogLevel.INFO)
 
-        # 尝试获取机器人 open_id（用于精确匹配 @提及）。
-        # lark_oapi.api.bot 子模块在部分打包版本中可能缺失，
-        # 导入失败不应阻断适配器启动——仅影响群聊 @提及检测。
-        _bot_info_error: str | None = None
-        try:
-            import lark_oapi.api.bot.v3 as bot_v3
+            sdk_domain = lark_oapi.LARK_DOMAIN if self.config.is_lark else lark_oapi.FEISHU_DOMAIN
+            self._client = (
+                lark_oapi.Client.builder()
+                .app_id(self.config.app_id)
+                .app_secret(self.config.app_secret)
+                .domain(sdk_domain)
+                .log_level(log_level)
+                .build()
+            )
 
-            for attempt in range(3):
-                try:
-                    req = bot_v3.GetBotInfoRequest.builder().build()
-                    resp = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda _r=req: self._client.bot.v3.bot_info.get(_r)
-                    )
-                    if resp.success() and resp.data and resp.data.bot:
-                        self._bot_open_id = getattr(resp.data.bot, "open_id", None)
-                        logger.info(f"Feishu bot open_id: {self._bot_open_id}")
-                        _bot_info_error = None
-                        break
-                    else:
-                        _bot_info_error = getattr(resp, "msg", "unknown")
-                        logger.warning(
-                            f"Feishu: GetBotInfo attempt {attempt + 1}/3 failed: {_bot_info_error}"
+            # 记录主事件循环，用于从 WebSocket 线程投递协程
+            try:
+                self._main_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._main_loop = None
+            logger.info("Feishu adapter: client initialized")
+
+            # 尝试获取机器人 open_id（用于精确匹配 @提及）。
+            # lark_oapi.api.bot 子模块在部分打包版本中可能缺失，
+            # 导入失败不应阻断适配器启动——仅影响群聊 @提及检测。
+            _bot_info_error: str | None = None
+            try:
+                import lark_oapi.api.bot.v3 as bot_v3
+
+                for attempt in range(3):
+                    try:
+                        req = bot_v3.GetBotInfoRequest.builder().build()
+                        resp = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda _r=req: self._client.bot.v3.bot_info.get(_r)
                         )
+                        if resp.success() and resp.data and resp.data.bot:
+                            self._bot_open_id = getattr(resp.data.bot, "open_id", None)
+                            logger.info(f"Feishu bot open_id: {self._bot_open_id}")
+                            _bot_info_error = None
+                            break
+                        else:
+                            _bot_info_error = getattr(resp, "msg", "unknown")
+                            logger.warning(
+                                f"Feishu: GetBotInfo attempt {attempt + 1}/3 failed: {_bot_info_error}"
+                            )
+                    except Exception as e:
+                        _bot_info_error = str(e)
+                        logger.warning(f"Feishu: GetBotInfo attempt {attempt + 1}/3 error: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+            except ImportError:
+                _log_bot_info_raw_http_fallback_notice()
+                try:
+                    raw_req = (
+                        lark_oapi.BaseRequest.builder()
+                        .http_method(lark_oapi.HttpMethod.GET)
+                        .uri("/open-apis/bot/v3/info")
+                        .token_types({lark_oapi.AccessTokenType.TENANT})
+                        .build()
+                    )
+                    raw_resp = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._client.request(raw_req)
+                    )
+                    if raw_resp.success() and raw_resp.raw:
+                        _body = json.loads(raw_resp.raw.content)
+                        _bot = _body.get("bot") or _body.get("data", {}).get("bot") or {}
+                        self._bot_open_id = _bot.get("open_id")
+                        if self._bot_open_id:
+                            logger.info(f"Feishu bot open_id (raw HTTP): {self._bot_open_id}")
+                            _bot_info_error = None
+                        else:
+                            _bot_info_error = "raw HTTP 返回中未包含 bot open_id"
+                    else:
+                        _bot_info_error = getattr(raw_resp, "msg", "raw HTTP fallback failed")
                 except Exception as e:
                     _bot_info_error = str(e)
-                    logger.warning(f"Feishu: GetBotInfo attempt {attempt + 1}/3 error: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(2)
-        except ImportError:
-            logger.warning("lark_oapi.api.bot module not available, trying raw HTTP fallback...")
+                    logger.warning(f"Feishu: raw HTTP bot info fallback failed: {e}")
+
+            if not self._bot_open_id and _bot_info_error:
+                _err_lower = (_bot_info_error or "").lower()
+                if any(
+                    kw in _err_lower
+                    for kw in ("invalid", "app_id", "secret", "token", "auth", "10003")
+                ):
+                    raise ConnectionError(
+                        f"{self.config.platform_label} App ID 或 App Secret 无效，请检查应用凭据。"
+                        f"（错误详情: {_bot_info_error}）"
+                    )
+                if "connect" in _err_lower or "timeout" in _err_lower or "resolve" in _err_lower:
+                    raise ConnectionError(
+                        f"无法连接{self.config.platform_label} API ({self.config.api_domain})，请检查网络连接。"
+                        f"（错误详情: {_bot_info_error}）"
+                    )
+                logger.warning(
+                    "Feishu: bot open_id not available. "
+                    "@mention detection will be disabled (bot will NOT respond to any @mention in groups)."
+                )
+
+            # 在启动 WS 之前标记为运行中：
+            # - 必须在 client 创建 + lark 导入成功之后（确保绿点不虚标）
+            # - 必须在 start_websocket 之前（WS 线程依赖 _running 判断是否记录错误）
+            self._running = True
+
+            # 自动启动 WebSocket 长连接（非阻塞模式）
             try:
-                raw_req = (
-                    lark_oapi.BaseRequest.builder()
-                    .http_method(lark_oapi.HttpMethod.GET)
-                    .uri("/open-apis/bot/v3/info")
-                    .token_types({lark_oapi.AccessTokenType.TENANT})
-                    .build()
-                )
-                raw_resp = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self._client.request(raw_req)
-                )
-                if raw_resp.success() and raw_resp.raw:
-                    _body = json.loads(raw_resp.raw.content)
-                    _bot = _body.get("bot") or _body.get("data", {}).get("bot") or {}
-                    self._bot_open_id = _bot.get("open_id")
-                    if self._bot_open_id:
-                        logger.info(f"Feishu bot open_id (raw HTTP): {self._bot_open_id}")
-                        _bot_info_error = None
-                    else:
-                        _bot_info_error = "raw HTTP 返回中未包含 bot open_id"
-                else:
-                    _bot_info_error = getattr(raw_resp, "msg", "raw HTTP fallback failed")
+                self.start_websocket(blocking=False)
+                logger.info("Feishu adapter: WebSocket started in background")
             except Exception as e:
-                _bot_info_error = str(e)
-                logger.warning(f"Feishu: raw HTTP bot info fallback failed: {e}")
+                logger.warning(f"Feishu adapter: WebSocket startup failed: {e}")
+                logger.warning("Feishu adapter: falling back to webhook-only mode")
 
-        if not self._bot_open_id and _bot_info_error:
-            _err_lower = (_bot_info_error or "").lower()
-            if any(
-                kw in _err_lower for kw in ("invalid", "app_id", "secret", "token", "auth", "10003")
+            if self._group_response_mode and self._group_response_mode != "mention_only":
+                logger.info(
+                    f"Feishu[{self.channel_name}]: group_response_mode={self._group_response_mode}, "
+                    f"请确保飞书后台已开启「接收群聊中所有消息」"
+                )
+
+            # 探测可用权限/能力
+            await self._probe_capabilities()
+
+            # 启动 WebSocket 看门狗（后台任务，周期性检查 WS 线程存活状态）
+            if self._ws_thread is not None and (
+                self._ws_watchdog_task is None or self._ws_watchdog_task.done()
             ):
-                raise ConnectionError(
-                    f"{self.config.platform_label} App ID 或 App Secret 无效，请检查应用凭据。"
-                    f"（错误详情: {_bot_info_error}）"
-                )
-            if "connect" in _err_lower or "timeout" in _err_lower or "resolve" in _err_lower:
-                raise ConnectionError(
-                    f"无法连接{self.config.platform_label} API ({self.config.api_domain})，请检查网络连接。"
-                    f"（错误详情: {_bot_info_error}）"
-                )
-            logger.warning(
-                "Feishu: bot open_id not available. "
-                "@mention detection will be disabled (bot will NOT respond to any @mention in groups)."
-            )
-
-        # 在启动 WS 之前标记为运行中：
-        # - 必须在 client 创建 + lark 导入成功之后（确保绿点不虚标）
-        # - 必须在 start_websocket 之前（WS 线程依赖 _running 判断是否记录错误）
-        self._running = True
-
-        # 自动启动 WebSocket 长连接（非阻塞模式）
-        try:
-            self.start_websocket(blocking=False)
-            logger.info("Feishu adapter: WebSocket started in background")
-        except Exception as e:
-            logger.warning(f"Feishu adapter: WebSocket startup failed: {e}")
-            logger.warning("Feishu adapter: falling back to webhook-only mode")
-
-        if self._group_response_mode and self._group_response_mode != "mention_only":
-            logger.info(
-                f"Feishu[{self.channel_name}]: group_response_mode={self._group_response_mode}, "
-                f"请确保飞书后台已开启「接收群聊中所有消息」"
-            )
-
-        # 探测可用权限/能力
-        await self._probe_capabilities()
-
-        # 启动 WebSocket 看门狗（后台任务，周期性检查 WS 线程存活状态）
-        if self._ws_thread is not None:
-            self._ws_watchdog_task = asyncio.create_task(self._ws_watchdog_loop())
+                self._ws_watchdog_task = asyncio.create_task(self._ws_watchdog_loop())
 
     # ==================== WebSocket 看门狗 ====================
 
@@ -555,6 +584,7 @@ class FeishuAdapter(ChannelAdapter):
         - 参数无效/资源不存在：说明权限本身是通过的
         """
         self._capabilities = ["发消息", "发文件", "回复消息"]
+        self._capability_degradations = []
         if not self._client:
             return
 
@@ -644,9 +674,8 @@ class FeishuAdapter(ChannelAdapter):
             if not self._is_token_error(resp):
                 self._capabilities.append("上传图片")
             else:
-                logger.warning(
-                    "Feishu: 缺少 im:resource:upload 权限，图片/表情包发送将不可用。"
-                    "请在飞书开放平台为机器人开通此权限。"
+                self._record_capability_degradation(
+                    "缺少 im:resource:upload 权限，图片/表情包发送将不可用"
                 )
         except Exception:
             pass
@@ -672,18 +701,24 @@ class FeishuAdapter(ChannelAdapter):
                     await self._finish_cardkit_card(probe_card_id, summary_text="probe")
             elif self._is_permission_error(result.get("msg", "")):
                 self._cardkit_available = False
-                logger.info(
-                    "Feishu: CardKit 权限不可用，流式输出将使用 PatchMessage（有 20-30 次编辑限制）。"
-                    "建议在飞书开放平台开通 cardkit:card:write 权限。"
+                self._record_capability_degradation(
+                    "CardKit 权限不可用，流式输出已降级为 PatchMessage（有 20-30 次编辑限制）"
                 )
             else:
                 self._cardkit_available = False
-                logger.info(f"Feishu: CardKit 探测失败，回退 PatchMessage: {result}")
+                self._record_capability_degradation(
+                    f"CardKit 探测失败，已降级为 PatchMessage: {result}"
+                )
         except Exception as e:
             self._cardkit_available = False
-            logger.info(f"Feishu: CardKit 探测异常，回退 PatchMessage: {e}")
+            self._record_capability_degradation(f"CardKit 探测异常，已降级为 PatchMessage: {e}")
 
-        logger.info(f"Feishu capabilities: {self._capabilities}")
+        logger.info("Feishu capabilities: %s", ", ".join(self._capabilities) or "none")
+        if self._capability_degradations:
+            logger.info(
+                "Feishu capability degradation: %s",
+                "；".join(self._capability_degradations),
+            )
         _stream_detail = (
             f"streaming={self._streaming_enabled}"
             f", group_streaming={self._group_streaming}"
@@ -698,6 +733,33 @@ class FeishuAdapter(ChannelAdapter):
                 "如需启用，请在 bot 配置中添加 streaming_enabled=true 或设置环境变量 FEISHU_STREAMING_ENABLED=true"
             )
 
+    def _record_capability_degradation(self, note: str) -> None:
+        text = str(note or "").strip()
+        if not text or text in self._capability_degradations:
+            return
+        self._capability_degradations.append(text)
+
+    def get_delivery_capability_snapshot(self) -> dict[str, Any]:
+        streaming_mode = (
+            "cardkit"
+            if self._cardkit_available is True
+            else ("patch_message" if self._cardkit_available is False else "unknown")
+        )
+        delivery_hint = ""
+        if self._cardkit_available is False:
+            delivery_hint = (
+                "Feishu CardKit 不可用，流式消息已降级为 PatchMessage；"
+                "基础文本/文件交付仍可用。"
+            )
+        return {
+            "platform": self.channel_name,
+            "delivery_degraded": bool(self._capability_degradations or self._cardkit_available is False),
+            "delivery_hint": delivery_hint,
+            "streaming_mode": streaming_mode,
+            "capabilities": list(self._capabilities),
+            "degradation_reasons": list(self._capability_degradations),
+        }
+
     def start_websocket(self, blocking: bool = True) -> None:
         """
         启动 WebSocket 长连接接收事件（推荐方式）
@@ -710,6 +772,13 @@ class FeishuAdapter(ChannelAdapter):
         Args:
             blocking: 是否阻塞主线程，默认为 True
         """
+        ws_thread = self._ws_thread
+        if ws_thread is not None and ws_thread.is_alive():
+            logger.info(
+                f"Feishu WebSocket already running for {self.channel_name}, skip duplicate start"
+            )
+            return
+
         _import_lark()
 
         if not self._event_dispatcher:
@@ -2177,43 +2246,44 @@ class FeishuAdapter(ChannelAdapter):
         不关闭旧连接会导致飞书平台在新旧连接间随机分发消息，
         发到旧连接上的消息因 _main_loop 已失效而被静默丢弃。
         """
-        self._running = False
+        async with self._lifecycle_lock:
+            self._running = False
 
-        # 0) 取消看门狗任务
-        if self._ws_watchdog_task is not None:
-            self._ws_watchdog_task.cancel()
-            self._ws_watchdog_task = None
+            # 0) 取消看门狗任务
+            if self._ws_watchdog_task is not None:
+                self._ws_watchdog_task.cancel()
+                self._ws_watchdog_task = None
 
-        # 1) 在 WS 线程的 loop 上调度 task 取消，然后 stop loop。
-        #    先取消 tasks 再 stop 可以让 _run_ws_in_thread 的 finally 块
-        #    里的 _drain_loop_tasks 更快完成（大部分 tasks 已经是 cancelled 状态）。
-        ws_loop = self._ws_loop
-        if ws_loop is not None:
-            try:
+            # 1) 在 WS 线程的 loop 上调度 task 取消，然后 stop loop。
+            #    先取消 tasks 再 stop 可以让 _run_ws_in_thread 的 finally 块
+            #    里的 _drain_loop_tasks 更快完成（大部分 tasks 已经是 cancelled 状态）。
+            ws_loop = self._ws_loop
+            if ws_loop is not None:
+                try:
 
-                def _cancel_and_stop() -> None:
-                    for task in asyncio.all_tasks(ws_loop):
-                        task.cancel()
-                    ws_loop.stop()
+                    def _cancel_and_stop() -> None:
+                        for task in asyncio.all_tasks(ws_loop):
+                            task.cancel()
+                        ws_loop.stop()
 
-                ws_loop.call_soon_threadsafe(_cancel_and_stop)
-            except Exception:
-                # loop 可能已关闭
-                with contextlib.suppress(Exception):
-                    ws_loop.call_soon_threadsafe(ws_loop.stop)
+                    ws_loop.call_soon_threadsafe(_cancel_and_stop)
+                except Exception:
+                    # loop 可能已关闭
+                    with contextlib.suppress(Exception):
+                        ws_loop.call_soon_threadsafe(ws_loop.stop)
 
-        # 2) 等待 WS 线程退出（给 5 秒超时）
-        ws_thread = self._ws_thread
-        if ws_thread is not None and ws_thread.is_alive():
-            ws_thread.join(timeout=5)
-            if ws_thread.is_alive():
-                logger.warning("Feishu WebSocket thread did not exit within 5s timeout")
+            # 2) 等待 WS 线程退出（给 5 秒超时）
+            ws_thread = self._ws_thread
+            if ws_thread is not None and ws_thread.is_alive():
+                ws_thread.join(timeout=5)
+                if ws_thread.is_alive():
+                    logger.warning("Feishu WebSocket thread did not exit within 5s timeout")
 
-        self._ws_client = None
-        self._ws_thread = None
-        self._ws_loop = None
-        self._client = None
-        logger.info("Feishu adapter stopped")
+            self._ws_client = None
+            self._ws_thread = None
+            self._ws_loop = None
+            self._client = None
+            logger.info("Feishu adapter stopped")
 
     def handle_event(self, body: dict, headers: dict) -> dict:
         """

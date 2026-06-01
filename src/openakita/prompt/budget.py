@@ -8,7 +8,7 @@ Prompt Budget - Token 预算裁剪模块
   - SOUL.md 已精简为 ~60 行行为约束（~500 tokens）
   - agent.core 编译后约 ~600 tokens
   - 用户自定义策略（可选）
-- catalogs_budget: 8000 tokens (tools 33% + skills 55% + mcp 10%)
+- catalogs_budget: 16000 tokens (tools 50% + skills 40% + mcp 10%)
   - 工具定义已通过 API tools 参数传递，system prompt 中的 catalog 仅补充描述
 - user_budget: 1200 tokens (user.summary + runtime_facts)
 - memory_budget: 3500 tokens (retriever 输出)
@@ -91,13 +91,13 @@ class BudgetConfig:
     # 各部分预算（tokens）
     identity_budget: int = 6000  # SOUL.md(60%) + agent.core(25%) + user_policies(15%)
     catalogs_budget: int = (
-        8000  # tools(33%) + skills(55%) + mcp(10%) — 工具定义已通过 API tools 参数传递
+        16000  # tools(50%) + skills(40%) + mcp(10%) — 提升预算确保工具描述完整
     )
     user_budget: int = 1200  # user.summary + runtime_facts
     memory_budget: int = 3500  # retriever 输出（含 MEMORY.md + pinned rules + vector memory）
 
     # 总预算（作为硬限制）
-    total_budget: int = 22000
+    total_budget: int = 27000
 
     # 裁剪优先级（数字越小越先被裁剪）
     # 高优先级的内容会在预算不足时保留
@@ -125,39 +125,39 @@ class BudgetConfig:
         prompt_budget = int(context_window * 0.40)
 
         if context_window > 32000:
-            # sum: 5000+10000+800+2500 = 18300
+            # sum: 5000+20000+800+2500 = 28300
             return cls(
                 identity_budget=5000,
-                catalogs_budget=10000,
+                catalogs_budget=20000,
                 user_budget=800,
                 memory_budget=2500,
-                total_budget=min(prompt_budget, 20000),
+                total_budget=min(prompt_budget, 30000),
             )
         elif context_window >= 16000:
-            # sum: 3500+6000+600+1800 = 11900
+            # sum: 3500+12000+600+1800 = 17900
             return cls(
                 identity_budget=3500,
-                catalogs_budget=6000,
+                catalogs_budget=12000,
                 user_budget=600,
                 memory_budget=1800,
-                total_budget=min(prompt_budget, 12000),
+                total_budget=min(prompt_budget, 20000),
             )
         elif context_window >= 8000:
-            # sum: 2500+4000+350+1000 = 7850
+            # sum: 2500+8000+350+1000 = 11850
             return cls(
                 identity_budget=2500,
-                catalogs_budget=4000,
+                catalogs_budget=8000,
                 user_budget=350,
                 memory_budget=1000,
-                total_budget=min(prompt_budget, 8000),
+                total_budget=min(prompt_budget, 12000),
             )
         else:
             return cls(
                 identity_budget=600,
-                catalogs_budget=800,
+                catalogs_budget=1600,
                 user_budget=150,
                 memory_budget=300,
-                total_budget=min(prompt_budget, 2000),
+                total_budget=min(prompt_budget, 3000),
             )
 
     @classmethod
@@ -175,18 +175,18 @@ class BudgetConfig:
         if tier == PromptTier.SMALL:
             return cls(
                 identity_budget=600,
-                catalogs_budget=800,
+                catalogs_budget=1600,
                 user_budget=150,
                 memory_budget=300,
-                total_budget=min(prompt_budget, 2000),
+                total_budget=min(prompt_budget, 3000),
             )
         elif tier == PromptTier.MEDIUM:
             return cls(
                 identity_budget=3000,
-                catalogs_budget=5000,
+                catalogs_budget=10000,
                 user_budget=600,
                 memory_budget=1800,
-                total_budget=min(prompt_budget, 10000),
+                total_budget=min(prompt_budget, 16000),
             )
         else:
             return cls()
@@ -403,8 +403,8 @@ def apply_budget_to_sections(
         "soul": config.identity_budget * 60 // 100,
         "agent_core": config.identity_budget * 25 // 100,
         "user_policies": config.identity_budget * 15 // 100,
-        "tools": config.catalogs_budget // 3,  # 33%
-        "skills": config.catalogs_budget * 55 // 100,  # 55%
+        "tools": config.catalogs_budget // 2,  # 50% — 确保工具目录描述完整
+        "skills": config.catalogs_budget * 40 // 100,  # 40%
         "mcp": config.catalogs_budget // 10,  # 10%
         "user": config.user_budget // 2,
         "runtime_facts": config.user_budget // 2,

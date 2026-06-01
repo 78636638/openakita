@@ -33,6 +33,10 @@ _engine_loop: asyncio.AbstractEventLoop | None = None
 _api_loop: asyncio.AbstractEventLoop | None = None
 
 
+def _is_live_loop(loop: asyncio.AbstractEventLoop | None) -> bool:
+    return loop is not None and not loop.is_closed()
+
+
 def set_engine_loop(loop: asyncio.AbstractEventLoop) -> None:
     global _engine_loop
     _engine_loop = loop
@@ -45,16 +49,40 @@ def set_api_loop(loop: asyncio.AbstractEventLoop) -> None:
     logger.info("[EngineBridge] API loop registered (id=%s)", id(loop))
 
 
+def clear_engine_loop(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    global _engine_loop
+    if loop is not None and _engine_loop is not loop:
+        return
+    if _engine_loop is not None:
+        logger.info("[EngineBridge] Engine loop cleared (id=%s)", id(_engine_loop))
+    _engine_loop = None
+
+
+def clear_api_loop(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    global _api_loop
+    if loop is not None and _api_loop is not loop:
+        return
+    if _api_loop is not None:
+        logger.info("[EngineBridge] API loop cleared (id=%s)", id(_api_loop))
+    _api_loop = None
+
+
 def get_engine_loop() -> asyncio.AbstractEventLoop | None:
+    if _engine_loop is not None and _engine_loop.is_closed():
+        clear_engine_loop(_engine_loop)
+        return None
     return _engine_loop
 
 
 def get_api_loop() -> asyncio.AbstractEventLoop | None:
+    if _api_loop is not None and _api_loop.is_closed():
+        clear_api_loop(_api_loop)
+        return None
     return _api_loop
 
 
 def is_dual_loop() -> bool:
-    return _engine_loop is not None and _api_loop is not None
+    return get_engine_loop() is not None and get_api_loop() is not None
 
 
 def _current_loop() -> asyncio.AbstractEventLoop | None:
@@ -74,23 +102,25 @@ async def to_engine(coro: Coroutine[Any, Any, Any]) -> Any:
     * If already in the engine loop → runs *coro* directly.
     * Otherwise → submits via ``run_coroutine_threadsafe`` and awaits.
     """
-    if _engine_loop is None:
+    engine_loop = get_engine_loop()
+    if engine_loop is None:
         return await coro
     current = _current_loop()
-    if current is _engine_loop:
+    if current is engine_loop:
         return await coro
-    future = asyncio.run_coroutine_threadsafe(coro, _engine_loop)
+    future = asyncio.run_coroutine_threadsafe(coro, engine_loop)
     return await asyncio.wrap_future(future)
 
 
 async def to_api(coro: Coroutine[Any, Any, Any]) -> Any:
     """Run *coro* in the API loop (e.g. WebSocket broadcast from the engine)."""
-    if _api_loop is None:
+    api_loop = get_api_loop()
+    if api_loop is None:
         return await coro
     current = _current_loop()
-    if current is _api_loop:
+    if current is api_loop:
         return await coro
-    future = asyncio.run_coroutine_threadsafe(coro, _api_loop)
+    future = asyncio.run_coroutine_threadsafe(coro, api_loop)
     return await asyncio.wrap_future(future)
 
 
@@ -100,16 +130,25 @@ def fire_in_api(coro: Coroutine[Any, Any, Any]) -> None:
     Fire-and-forget variant of :func:`to_api`, used for broadcasting events
     from the engine loop where we don't care about the return value.
     """
-    if _api_loop is None:
+    api_loop = get_api_loop()
+    if api_loop is None:
         loop = _current_loop()
         if loop is not None:
             loop.create_task(coro)
+        else:
+            coro.close()
         return
     current = _current_loop()
-    if current is _api_loop:
-        _api_loop.create_task(coro)
+    if current is api_loop:
+        api_loop.create_task(coro)
     else:
-        asyncio.run_coroutine_threadsafe(coro, _api_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, api_loop)
+        except RuntimeError as exc:
+            logger.debug("[EngineBridge] fire_in_api dropped coroutine: %s", exc)
+            if "closed" in str(exc).lower():
+                clear_api_loop(api_loop)
+            coro.close()
 
 
 # ── Cross-loop async generator bridge ──────────────────────────────────
@@ -171,6 +210,5 @@ async def engine_stream(async_gen: AsyncIterator[Any]) -> AsyncIterator[Any]:
 
 def shutdown() -> None:
     """Clear loop references (called during process shutdown)."""
-    global _engine_loop, _api_loop
-    _engine_loop = None
-    _api_loop = None
+    clear_engine_loop()
+    clear_api_loop()

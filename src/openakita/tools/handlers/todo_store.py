@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ...utils.atomic_io import read_json_safe, safe_json_write
+from .todo_state import is_restorable_todo_plan
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,23 @@ class TodoStore:
             return {}
         try:
             if isinstance(raw, dict) and "todos" in raw:
+                todos = raw["todos"] if isinstance(raw.get("todos"), dict) else {}
                 self._data = {
-                    k: v
-                    for k, v in raw["todos"].items()
-                    if isinstance(v, dict) and v.get("status") == "in_progress"
+                    conversation_id: plan
+                    for conversation_id, plan in todos.items()
+                    if is_restorable_todo_plan(plan)
                 }
+                dropped_count = sum(
+                    1
+                    for _conversation_id, plan in todos.items()
+                    if isinstance(plan, dict) and not is_restorable_todo_plan(plan)
+                )
+                if dropped_count:
+                    self._dirty = True
+                    logger.info(
+                        "[TodoStore] Dropped %d stale in-progress plan(s) during load",
+                        dropped_count,
+                    )
                 return dict(self._data)
         except Exception as e:
             logger.warning(f"[TodoStore] Load parse error: {e}")

@@ -14,11 +14,34 @@ import hashlib
 import logging
 import re
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from pathlib import Path
 
 from ..utils.redaction import RedactionFilter
 from .handlers import ColoredConsoleHandler, ErrorOnlyHandler, SessionLogHandler
+
+
+class ConsoleMessageSuppressFilter(logging.Filter):
+    """Suppress specific noisy console records without touching file logs."""
+
+    def __init__(
+        self,
+        patterns: list[str] | tuple[str, ...],
+        logger_prefixes: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__()
+        self._regexes = [re.compile(pattern) for pattern in patterns if str(pattern or "").strip()]
+        self._logger_prefixes = tuple(
+            prefix.strip() for prefix in (logger_prefixes or ()) if str(prefix or "").strip()
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._logger_prefixes:
+            name = str(getattr(record, "name", "") or "")
+            if not any(name == prefix or name.startswith(f"{prefix}.") for prefix in self._logger_prefixes):
+                return True
+        message = record.getMessage()
+        return not any(regex.search(message) for regex in self._regexes)
 
 
 def _compute_frontend_fingerprint() -> str:
@@ -162,6 +185,114 @@ def setup_logging(
     log_startup_banner(root_logger)
 
     return root_logger
+
+
+def set_console_log_level(level: int | str) -> int:
+    """Adjust non-file console stream handlers without affecting file logs."""
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.WARNING)
+
+    updated = 0
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, (logging.FileHandler, TimedRotatingFileHandler, RotatingFileHandler)
+        ):
+            handler.setLevel(level)
+            updated += 1
+    return updated
+
+
+def add_console_suppression_filter(
+    patterns: list[str] | tuple[str, ...],
+    logger_prefixes: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    """Add a suppress filter to non-file console handlers.
+
+    The filter is intentionally console-only so noisy SDK events can remain in
+    file logs for later diagnosis while staying out of the interactive CLI.
+    """
+    root_logger = logging.getLogger()
+    updated = 0
+    for handler in root_logger.handlers:
+        if not isinstance(handler, logging.StreamHandler) or isinstance(
+            handler, (logging.FileHandler, TimedRotatingFileHandler, RotatingFileHandler)
+        ):
+            continue
+        already_present = any(
+            isinstance(existing, ConsoleMessageSuppressFilter)
+            and existing._logger_prefixes == tuple(
+                prefix.strip() for prefix in (logger_prefixes or ()) if str(prefix or "").strip()
+            )
+            and [regex.pattern for regex in existing._regexes]
+            == [str(pattern) for pattern in patterns if str(pattern or "").strip()]
+            for existing in handler.filters
+        )
+        if already_present:
+            continue
+        handler.addFilter(ConsoleMessageSuppressFilter(patterns, logger_prefixes))
+        updated += 1
+    return updated
+
+
+def set_named_logger_level(name: str, level: int | str) -> logging.Logger:
+    """Adjust one named logger and its existing handlers."""
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.WARNING)
+
+    target = logging.getLogger(name)
+    target.setLevel(level)
+    for handler in target.handlers:
+        handler.setLevel(level)
+    return target
+
+
+def remove_named_logger_console_handlers(name: str) -> int:
+    """Remove non-file stream handlers from a named logger."""
+    target = logging.getLogger(name)
+    removed = 0
+    for handler in list(target.handlers):
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, (logging.FileHandler, TimedRotatingFileHandler, RotatingFileHandler)
+        ):
+            target.removeHandler(handler)
+            removed += 1
+    return removed
+
+
+def quiet_logger_family_on_console(
+    prefixes: list[str] | tuple[str, ...],
+    level: int | str = logging.ERROR,
+) -> int:
+    """Remove console handlers from matching logger families, keep ERROR via root.
+
+    This is useful for third-party SDKs that attach their own stdout handlers
+    after startup and bypass the root console level. Matching loggers keep
+    propagating to root so ERROR still appears in the interactive CLI.
+    """
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.WARNING)
+
+    cleaned = 0
+    all_names = list(logging.root.manager.loggerDict.keys())
+    candidates: set[str] = set()
+    for raw_prefix in prefixes:
+        prefix = str(raw_prefix or "").strip()
+        if not prefix:
+            continue
+        candidates.add(prefix)
+        for name in all_names:
+            if name == prefix or name.startswith(f"{prefix}."):
+                candidates.add(name)
+
+    for name in sorted(candidates):
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        logger.propagate = True
+        for handler in logger.handlers:
+            handler.setLevel(level)
+        cleaned += remove_named_logger_console_handlers(name)
+    return cleaned
 
 
 def get_logger(name: str) -> logging.Logger:

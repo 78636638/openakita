@@ -471,7 +471,38 @@ class ContextManager:
             f"last_real={pressure.last_real_input_tokens}"
         )
 
-        if not force and pressure.trigger_tokens <= soft_limit:
+        # 触发条件：1) token 超过软限  2) 消息数过多(>25条)  3) 总token超过有效区间
+        # MiniMax M2.7 在 70k+ 输入时工具调用能力显著下降，建议保持总输入在 60k 以内
+        msg_count = len(messages)
+        total_tokens = pressure.estimated_total_tokens
+        # 有效工作区间：60k tokens（基于 MiniMax M2.7 实际表现）
+        effective_working_limit = 60000
+        hard_total_limit = 80000  # 硬上限，超过则强制截断
+
+        # 硬上限保护：总输入超过 80k 时，强制只保留最近 4 轮对话
+        if total_tokens > hard_total_limit:
+            logger.warning(
+                f"[Compress] Total input {total_tokens} exceeds hard limit {hard_total_limit}, "
+                f"forcing aggressive truncation to last 4 turns"
+            )
+            # 只保留最近 4 轮对话（8 条消息：user-assistant 配对）
+            preserved_turns = 4
+            preserved_count = min(preserved_turns * 2, len(messages))
+            truncated = messages[-preserved_count:]
+            truncated_tokens = self.estimate_messages_tokens(truncated)
+            logger.info(
+                f"[Compress] Hard truncated from {len(messages)} msgs to {len(truncated)} msgs, "
+                f"{total_tokens} tokens to {truncated_tokens} tokens"
+            )
+            return self._sanitize_tool_pairs(truncated)
+
+        should_compress = (
+            force
+            or pressure.trigger_tokens > soft_limit
+            or msg_count > 25  # 降低消息数阈值，更早触发压缩
+            or total_tokens > effective_working_limit
+        )
+        if not should_compress:
             return messages
 
         # v2: 压缩前记忆提取 — 确保即将被压缩的消息先保存到记忆

@@ -13,6 +13,7 @@ Skills 系统遵循 Agent Skills 规范 (agentskills.io)
 MCP 系统遵循 Model Context Protocol 规范 (modelcontextprotocol.io)
 """
 
+import ast
 import asyncio
 import base64
 import contextlib
@@ -71,6 +72,7 @@ from ..tools.handlers.opencli import create_handler as create_opencli_handler
 from ..tools.handlers.opencli import is_available as opencli_available
 from ..tools.handlers.persona import create_handler as create_persona_handler
 from ..tools.handlers.plan import create_todo_handler
+from ..tools.handlers.planner import create_handler as create_planner_handler
 from ..tools.handlers.plugins import create_handler as create_plugins_handler
 from ..tools.handlers.powershell import create_handler as create_powershell_handler
 from ..tools.handlers.profile import create_handler as create_profile_handler
@@ -116,6 +118,7 @@ from .response_handler import (
 from .risk_intent import RiskIntentResult, RiskLevel, TargetKind, classify_risk_intent
 from .skill_manager import SkillManager
 from .task_monitor import RETROSPECT_PROMPT, TaskMonitor
+from .task_planner import SubTask, TaskExecutor, TaskPlanner, canonicalize_sub_tasks
 from .token_tracking import (
     TokenTrackingContext,
     init_token_tracking,
@@ -502,6 +505,91 @@ def _looks_like_external_tool_request(message: str) -> bool:
     return any(marker in text for marker in _EXTERNAL_TOOL_MARKERS)
 
 
+def _should_force_todo_for_action_intent(intent: Any, message: str) -> bool:
+    """Force Todo mode for externally executed action tasks.
+
+    Goal: when LLM intent analysis already concluded the turn is an actionable
+    tool-driven task, especially one involving IM delivery + agent
+    coordination, require a Todo/plan chain up front instead of allowing the
+    model to jump straight to an unverifiable final answer.
+    """
+    if not intent:
+        return False
+
+    from .intent_analyzer import IntentType
+
+    if getattr(intent, "intent", None) != IntentType.TASK:
+        return False
+
+    task_type = str(getattr(intent, "task_type", "") or "").lower()
+    if task_type not in {"action", "compound"}:
+        return False
+
+    requires_tools = bool(getattr(intent, "requires_tools", False))
+    force_tool = bool(getattr(intent, "force_tool", False))
+    if not (requires_tools or force_tool):
+        return False
+
+    tool_hints = {str(item) for item in (getattr(intent, "tool_hints", []) or []) if str(item)}
+    text = (message or "").lower()
+
+    im_markers = (
+        "飞书", "feishu", "telegram", "微信", "wecom", "钉钉", "dingtalk", "qq",
+        "消息", "群", "私聊",
+    )
+    delivery_markers = (
+        "推送", "发送", "发给", "发到", "回复", "交付", "上传", "通知",
+        "二维码", "附件", "图片", "文件", "截图",
+    )
+    recovery_markers = ("重新", "重发", "补发", "再次", "刚才", "未成功", "失败")
+    browser_action_markers = (
+        "浏览器", "页面", "网页", "刷新", "打开", "访问", "提取", "获取", "登录",
+    )
+    artifact_markers = ("二维码", "扫码", "截图", "图片")
+
+    is_im_delivery = (
+        (
+            "IM Channel" in tool_hints
+            or any(marker in text for marker in im_markers)
+        )
+        and any(marker in text for marker in delivery_markers)
+    )
+    is_retry_like = is_im_delivery and any(marker in text for marker in recovery_markers)
+    is_browser_artifact_delivery = (
+        "Browser" in tool_hints
+        and any(marker in text for marker in browser_action_markers)
+        and any(marker in text for marker in artifact_markers)
+        and (
+            any(marker in text for marker in delivery_markers)
+            or any(marker in text for marker in recovery_markers)
+        )
+    )
+
+    # Agent + IM delivery tasks are usually multi-step in practice:
+    # locate artifact/state -> check channel -> deliver -> verify/recap.
+    if "Agent" in tool_hints and "IM Channel" in tool_hints:
+        return True
+    if is_retry_like:
+        return True
+    if is_browser_artifact_delivery:
+        return True
+    return is_im_delivery and len(tool_hints) >= 2
+
+
+def _should_default_orchestrate_task(intent: Any, message: str) -> bool:
+    """Whether the main agent should prefer planner->todo->delegate flow."""
+    if not _should_force_todo_for_action_intent(intent, message):
+        return False
+    tool_hints = {str(item) for item in (getattr(intent, "tool_hints", []) or []) if str(item)}
+    text = (message or "").lower()
+    browser_delivery_markers = ("二维码", "扫码", "截图", "图片", "提取", "推送", "发送", "最新")
+    return (
+        "Agent" in tool_hints
+        or "IM Channel" in tool_hints
+        or ("Browser" in tool_hints and any(marker in text for marker in browser_delivery_markers))
+    )
+
+
 # ---- 本地图片附件 → data URL（BUG-1 修复） ----
 # 上传到 /api/uploads/<name> 的图片只能在本机通过 HTTP 访问，
 # 远端云模型（通义/OpenAI vision）无法回调 127.0.0.1，会报 InvalidParameter。
@@ -736,6 +824,7 @@ MINIMAL_PROMPT_TOOLS = {
     "semantic_search",
     "web_search",
     "web_fetch",
+    "deliver_artifacts",  # IM 通道附件交付（支持飞书/telegram 等推送）
 }
 
 
@@ -1066,6 +1155,17 @@ def set_primary_agent(agent: "Agent | None") -> None:
 
 def get_primary_agent() -> "Agent | None":
     return _PRIMARY_AGENT
+
+
+def _get_owned_browser_manager(agent: "Agent") -> object | None:
+    """Return the browser manager this agent should close on shutdown."""
+    browser_manager = getattr(agent, "browser_manager", None)
+    if browser_manager is None:
+        return None
+    shared_from = getattr(agent, "_shared_runtime_from", None)
+    if shared_from is not None and browser_manager is getattr(shared_from, "browser_manager", None):
+        return None
+    return browser_manager
 
 
 class Agent:
@@ -1641,11 +1741,19 @@ class Agent:
                     self.tool_catalog.set_deferred_tools(set())
                 logger.info("[Agent] no-tool intent: user explicitly requested no tool calls")
                 return []
+            # IM 相关关键词：涉及推送/消息/飞书/telegram 等场景时，需要完整工具集
+            im_related_keywords = (
+                "飞书", "feishu", "telegram", "微信", "wecom", "钉钉", "dingtalk",
+                "推送", "推送消息", "发送消息", "im", "消息推送", "二维码",
+            )
+            is_im_related = any(kw in user_message for kw in im_related_keywords)
+
             minimal_prompt = (
                 intent.intent in (IntentType.CHAT, IntentType.QUERY, IntentType.FOLLOW_UP)
                 and not requires_tools
                 and not force_tool
                 and not intent_hints
+                and not is_im_related
                 and prompt_depth in (PromptDepth.FAST, PromptDepth.MINIMAL)
                 or (
                     intent.intent == IntentType.FOLLOW_UP
@@ -1653,6 +1761,7 @@ class Agent:
                     and not requires_tools
                     and not force_tool
                     and not intent_hints
+                    and not is_im_related
                 )
             )
             if minimal_prompt:
@@ -1721,6 +1830,27 @@ class Agent:
                 sorted(user_always_cats) if user_always_cats else "[]",
                 sorted(intent_hints) if intent_hints else "[]",
             )
+
+        # Sub-task context: if this agent is executing a sub-task,
+        # filter tools to only those required + base system tools.
+        current_sub_task = getattr(self, "_current_sub_task", None)
+        if current_sub_task:
+            required = set(current_sub_task.get("required_tools", []))
+            if required:
+                base_tools = {
+                    "ask_user",
+                    "tool_search",
+                    "get_session_context",
+                    "plan_task",
+                }
+                allowed = required | base_tools
+                tools = [t for t in tools if t.get("name") in allowed]
+                logger.info(
+                    "[Agent] Sub-task tool filter: %d tools (required=%d)",
+                    len(tools),
+                    len(required),
+                )
+                return tools
 
         ctx = self._get_raw_context_window()
         if 0 < ctx < 8000:
@@ -2503,6 +2633,9 @@ class Agent:
 
         # Plan 模式
         self.handler_registry.register("plan", create_todo_handler(self))
+
+        # Task Planner（任务拆解）
+        self.handler_registry.register("planner", create_planner_handler(self))
 
         # 系统工具
         self.handler_registry.register("system", create_system_handler(self))
@@ -3623,6 +3756,60 @@ class Agent:
                 return str(sid)
         return None
 
+    @staticmethod
+    def _stable_cache_fragment(value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    def _build_prompt_cache_isolation_scope(
+        self,
+        *,
+        session: "Session | None",
+        session_type: str,
+        tools_enabled: bool,
+        session_context: dict[str, Any] | None,
+    ) -> tuple[Any, ...]:
+        from .feature_flags import is_enabled as _ff_enabled
+
+        if not _ff_enabled("prompt_cache_isolation_v1"):
+            return ()
+
+        workspace_id = ""
+        if session is not None:
+            try:
+                workspace_id = self._resolve_memory_workspace_id(session)
+            except Exception:
+                workspace_id = ""
+
+        current_sub_task = getattr(self, "_current_sub_task", None) or {}
+        required_tools = tuple(sorted(current_sub_task.get("required_tools", []) or []))
+        session_scope = ()
+        if session is not None:
+            session_scope = (
+                getattr(session, "channel", ""),
+                getattr(session, "chat_type", ""),
+                getattr(session, "bot_instance_id", "") or getattr(session, "channel", ""),
+                getattr(session, "chat_id", ""),
+                getattr(session, "user_id", ""),
+                getattr(session, "thread_id", "") or "",
+                workspace_id,
+            )
+
+        return (
+            session_type,
+            bool(tools_enabled),
+            bool(getattr(self, "_is_sub_agent_call", False)),
+            session_scope,
+            required_tools,
+            tuple(sorted(getattr(self, "_selfcheck_allowed_tools", None) or ())),
+            tuple(sorted(getattr(self, "_cron_disabled_tools", None) or ())),
+            self._stable_cache_fragment((session_context or {}).get("authorized_intent")),
+            str((session_context or {}).get("language", "") or ""),
+            bool((session_context or {}).get("has_sub_agents", False)),
+        )
+
     def _current_model_info_for_turn(
         self,
         *,
@@ -3870,6 +4057,12 @@ class Agent:
             tuple(sorted(_mem_keywords)) if _mem_keywords else (),
             _working_facts_cache_key,
             bool((session_context or {}).get("evidence_recommended", False)),
+            self._build_prompt_cache_isolation_scope(
+                session=session,
+                session_type=session_type,
+                tools_enabled=tools_enabled,
+                session_context=session_context,
+            ),
         )
 
         if (
@@ -5081,6 +5274,7 @@ class Agent:
                     user_id=getattr(session, "user_id", None) if session else None,
                     workspace_id=memory_workspace_id,
                     focus_terms=getattr(getattr(session, "context", None), "focus_terms", None),
+                    session=session,
                 )
                 attach_session = getattr(self.memory_manager, "attach_session_context", None)
                 if callable(attach_session):
@@ -5270,7 +5464,12 @@ class Agent:
             from ..tools.handlers.plan import require_todo_for_session, should_require_todo
 
             has_multi_actions = should_require_todo(message)
-            if intent_result.todo_required or has_multi_actions:
+            force_todo = _should_force_todo_for_action_intent(intent_result, message)
+            if force_todo:
+                logger.info(
+                    f"[Session:{session_id}] External action task detected, forcing Todo mode"
+                )
+            if intent_result.todo_required or has_multi_actions or force_todo:
                 require_todo_for_session(conversation_id, True)
                 logger.info(f"[Session:{session_id}] Multi-step task detected, Plan required")
 
@@ -6557,20 +6756,72 @@ class Agent:
                     logger.warning(f"[FastQuery] Failed ({e}), falling back to full agent")
 
             if not _fast_handled:
-                # All non-fast paths, or fast_reply fallback → ReasoningEngine
-                response_text = await self._chat_with_tools_and_context(
-                    messages,
-                    task_monitor=task_monitor,
-                    session_type=session_type,
-                    thinking_mode=_thinking_mode,
-                    thinking_depth=_thinking_depth,
-                    progress_callback=_progress_cb,
-                    session=session,
-                    endpoint_override=endpoint_override,
-                    endpoint_policy=endpoint_policy,
-                    intent_result=_intent,
-                    mode=mode,
-                )
+                # === Task Planner integration ===
+                # When intent suggests a plan, or the turn is an external
+                # execution task that should be orchestrated by default,
+                # decompose into sub-tasks and execute.
+                _plan_result = None
+                _force_orchestration = _should_default_orchestrate_task(_intent, message)
+                _previous_plan_id = None
+                if (
+                    _intent
+                    and (getattr(_intent, "suggest_plan", False) or _force_orchestration)
+                    and not getattr(self, "_is_sub_agent_call", False)
+                    and mode == "agent"
+                ):
+                    try:
+                        from ..tools.handlers.plan import get_active_plan_id
+
+                        _previous_plan_id = get_active_plan_id(session_id) or None
+                        logger.info(
+                            "[Agent] Planner orchestration triggered "
+                            "(score=%s, force=%s), invoking TaskPlanner",
+                            getattr(_intent, "complexity", None) and _intent.complexity.score,
+                            _force_orchestration,
+                        )
+                        _plan_result = await self._execute_task_plan(
+                            message=message,
+                            session=session,
+                            session_id=session_id,
+                            task_monitor=task_monitor,
+                        )
+                        if _plan_result:
+                            response_text = _plan_result
+                            _fast_handled = True
+                        else:
+                            await self._cleanup_stale_todo_after_plan_fallback(
+                                session_id,
+                                _previous_plan_id,
+                            )
+                    except Exception as _plan_exc:
+                        logger.warning(
+                            "[Agent] TaskPlanner failed: %s, falling back to ReasoningEngine",
+                            _plan_exc,
+                        )
+                        await self._cleanup_stale_todo_after_plan_fallback(
+                            session_id,
+                            _previous_plan_id,
+                        )
+
+                if not _fast_handled:
+                    await self._ensure_required_todo_visible(
+                        message=message,
+                        session_id=session_id,
+                    )
+                    # All non-fast paths, or fast_reply fallback → ReasoningEngine
+                    response_text = await self._chat_with_tools_and_context(
+                        messages,
+                        task_monitor=task_monitor,
+                        session_type=session_type,
+                        thinking_mode=_thinking_mode,
+                        thinking_depth=_thinking_depth,
+                        progress_callback=_progress_cb,
+                        session=session,
+                        endpoint_override=endpoint_override,
+                        endpoint_policy=endpoint_policy,
+                        intent_result=_intent,
+                        mode=mode,
+                    )
 
             # === flush 残留的 IM 进度消息，确保思维链先于回答到达 ===
             if gateway and session:
@@ -7194,8 +7445,97 @@ class Agent:
                         }
                     return
 
+            _plan_result = None
+            _force_orchestration = _should_default_orchestrate_task(_intent, message)
+            _previous_plan_id = None
+            if (
+                _intent
+                and (getattr(_intent, "suggest_plan", False) or _force_orchestration)
+                and not getattr(self, "_is_sub_agent_call", False)
+                and mode == "agent"
+            ):
+                try:
+                    from ..tools.handlers.plan import get_active_plan_id
+
+                    _previous_plan_id = get_active_plan_id(session_id) or None
+                    logger.info(
+                        "[Agent] Planner orchestration triggered "
+                        "(score=%s, force=%s), invoking TaskPlanner",
+                        getattr(_intent, "complexity", None) and _intent.complexity.score,
+                        _force_orchestration,
+                    )
+                    _plan_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+                    async def _enqueue_plan_event(event: dict[str, Any]) -> None:
+                        await _plan_event_queue.put(dict(event or {}))
+
+                    _plan_task = asyncio.create_task(
+                        self._execute_task_plan(
+                            message=message,
+                            session=session,
+                            session_id=session_id,
+                            task_monitor=task_monitor,
+                            stream_event_sink=_enqueue_plan_event,
+                        )
+                    )
+
+                    while True:
+                        if _plan_task.done() and _plan_event_queue.empty():
+                            break
+                        try:
+                            _plan_event = await asyncio.wait_for(_plan_event_queue.get(), timeout=0.1)
+                        except TimeoutError:
+                            continue
+                        if isinstance(_plan_event, dict) and _plan_event.get("type"):
+                            yield _plan_event
+
+                    _plan_result = await _plan_task
+                    if _plan_result:
+                        _reply_text = _plan_result
+                        chunk_size = 20
+                        for i in range(0, len(_plan_result), chunk_size):
+                            yield {"type": "text_delta", "content": _plan_result[i : i + chunk_size]}
+                            await asyncio.sleep(0.01)
+                        yield {"type": "done"}
+                        await self._finalize_session(
+                            response_text=_reply_text,
+                            session=session,
+                            session_id=session_id,
+                            task_monitor=task_monitor,
+                        )
+                        return
+                    await self._cleanup_stale_todo_after_plan_fallback(
+                        session_id,
+                        _previous_plan_id,
+                        stream_event_sink=_enqueue_plan_event,
+                    )
+                except Exception as _plan_exc:
+                    logger.warning(
+                        "[Agent] TaskPlanner failed: %s, falling back to ReasoningEngine",
+                        _plan_exc,
+                    )
+                    await self._cleanup_stale_todo_after_plan_fallback(
+                        session_id,
+                        _previous_plan_id,
+                        stream_event_sink=_enqueue_plan_event if "_enqueue_plan_event" in locals() else None,
+                    )
+
             # LLM-classified CHAT (non-fast_reply) falls through to reason_stream
             # with force_tool_retries=0, so tools are available but not forced.
+            _todo_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+            async def _enqueue_todo_event(event: dict[str, Any]) -> None:
+                await _todo_event_queue.put(dict(event or {}))
+
+            await self._ensure_required_todo_visible(
+                message=message,
+                session_id=session_id,
+                stream_event_sink=_enqueue_todo_event,
+            )
+            while not _todo_event_queue.empty():
+                _todo_event = await _todo_event_queue.get()
+                if isinstance(_todo_event, dict) and _todo_event.get("type"):
+                    yield _todo_event
 
             # Complexity detection: soft suggestion instead of hard interruption
             # suppress_plan=True means the intent analyzer explicitly decided
@@ -7470,8 +7810,9 @@ class Agent:
             or getattr(self.reasoning_engine, "_last_react_trace", None)
             or []
         )
+        ws_section = self._build_work_summary_section()
         if not trace:
-            return ""
+            return ws_section or ""
 
         TOTAL_RESULT_BUDGET = 4000
         num_tools = sum(len(it.get("tool_calls", [])) for it in trace)
@@ -7538,8 +7879,7 @@ class Agent:
 
         parts: list[str] = []
 
-        if has_delegation:
-            ws_section = self._build_work_summary_section()
+        if has_delegation or ws_section:
             if ws_section:
                 parts.append(ws_section)
 
@@ -7596,10 +7936,16 @@ class Agent:
         session = self._current_session
         if not session:
             return ""
-        records = getattr(getattr(session, "context", None), "sub_agent_records", None)
-        if not records:
+        context = getattr(session, "context", None)
+        orchestration_records = getattr(context, "orchestration_records", None) or []
+        records = getattr(context, "sub_agent_records", None) or []
+        if not orchestration_records and not records:
             return ""
-        summaries = [r.get("work_summary", "") for r in records if r.get("work_summary")]
+        summaries: list[str] = []
+        summaries.extend(
+            r.get("work_summary", "") for r in orchestration_records if r.get("work_summary")
+        )
+        summaries.extend(r.get("work_summary", "") for r in records if r.get("work_summary"))
         if not summaries:
             return ""
         lines = ["\n\n<<DELEGATION_TRACE>>"]
@@ -8479,6 +8825,1047 @@ class Agent:
                 policy,
                 exc_info=True,
             )
+
+    async def _execute_task_plan(
+        self,
+        message: str,
+        session: Any,
+        session_id: str,
+        task_monitor: Any | None = None,
+        stream_event_sink: Any | None = None,
+    ) -> str | None:
+        """Execute a complex task via TaskPlanner decomposition.
+
+        1. Call plan_task to decompose the task into sub-tasks.
+        2. Execute sub-tasks via TaskExecutor (parallel/sequential).
+        3. Collect results and return a summary.
+
+        Returns None if planning fails or is not applicable.
+        """
+        from ..agents.orchestrator import AgentOrchestrator
+
+        plan_started_at = datetime.now().isoformat()
+
+        # Get available tools for planning context
+        available_tools = [t.get("name", "") for t in self._effective_tools if t.get("name")]
+
+        # Create planner and generate sub-tasks
+        planner = TaskPlanner(self.brain)
+        try:
+            sub_tasks = await planner.plan(
+                task_description=message,
+                context=f"Session: {session_id}",
+                max_sub_tasks=5,
+                available_tools=available_tools,
+            )
+        except Exception as e:
+            logger.warning("[TaskPlan] Planning failed: %s", e)
+            return None
+        learning_usage_summary = None
+        try:
+            getter = getattr(planner, "get_last_learning_usage_summary", None)
+            if callable(getter):
+                learning_usage_summary = getter()
+        except Exception as exc:
+            logger.debug("[TaskPlan] Failed to read planner learning usage summary: %s", exc)
+
+        if not sub_tasks:
+            logger.info("[TaskPlan] No sub-tasks generated, falling back")
+            return None
+
+        sub_tasks = canonicalize_sub_tasks(sub_tasks)
+        sub_tasks = self._append_task_plan_review_step(sub_tasks, task_message=message)
+
+        logger.info(
+            "[TaskPlan] Generated %d sub-tasks: %s",
+            len(sub_tasks),
+            [t.id for t in sub_tasks],
+        )
+
+        await self._initialize_task_plan_todo(message, sub_tasks)
+        if callable(stream_event_sink):
+            plan_id = ""
+            try:
+                from ..tools.handlers.plan import get_active_plan_id
+
+                plan_id = get_active_plan_id(session_id) or ""
+            except Exception:
+                pass
+            await stream_event_sink(
+                {
+                    "type": "todo_created",
+                    "plan": {
+                        "id": plan_id or f"plan_{uuid.uuid4().hex[:8]}",
+                        "taskSummary": message[:200],
+                        "steps": [
+                            {
+                                "id": task.id,
+                                "description": task.description,
+                                "status": "pending",
+                            }
+                            for task in sub_tasks
+                        ],
+                        "status": "in_progress",
+                    },
+                }
+            )
+
+        # Create orchestrator for delegation
+        orchestrator = getattr(self, "_orchestrator", None)
+        if orchestrator is None:
+            # Fallback: lazily create the shared orchestrator using the same
+            # wiring contract as the main entrypoint / agent tool handler.
+            try:
+                orchestrator = AgentOrchestrator()
+                gateway = None
+                if session and hasattr(session, "get_metadata"):
+                    gateway = session.get_metadata("_gateway")
+                if gateway:
+                    orchestrator.set_gateway(gateway)
+                    if hasattr(gateway, "set_orchestrator"):
+                        gateway.set_orchestrator(orchestrator)
+                self._orchestrator = orchestrator
+            except Exception as e:
+                logger.warning("[TaskPlan] Failed to create orchestrator: %s", e)
+                return None
+
+        # Execute sub-tasks
+        async def _on_step_status(sub_task: SubTask, status: str, meta: dict[str, Any]) -> None:
+            await self._handle_task_plan_step_status(sub_task, status, meta)
+            if callable(stream_event_sink):
+                mapped_status = "in_progress" if status == "in_progress" else status
+                await stream_event_sink(
+                    {
+                        "type": "todo_step_updated",
+                        "step_id": sub_task.id,
+                        "stepId": sub_task.id,
+                        "status": mapped_status,
+                    }
+                )
+
+        async def _on_runtime_event(event: dict[str, Any]) -> None:
+            if not callable(stream_event_sink):
+                return
+            payload = dict(event or {})
+            if payload.get("type") == "sub_agent_state":
+                payload.setdefault("session_id", session_id)
+            await stream_event_sink(payload)
+
+        executor = TaskExecutor(
+            orchestrator,
+            on_step_status=_on_step_status,
+            on_runtime_event=_on_runtime_event,
+        )
+        results: dict[str, str] = {}
+        execution_error: str | None = None
+        try:
+            results = await executor.execute(sub_tasks, session, from_agent="main")
+        except Exception as e:
+            logger.warning("[TaskPlan] Execution failed: %s", e)
+            execution_error = str(e)
+            results = dict(getattr(executor, "results", {}) or {})
+
+        await self._mark_unresolved_task_plan_steps_failed(
+            sub_tasks,
+            results,
+            failure_reason=(
+                f"编排执行异常中止: {execution_error}"
+                if execution_error
+                else "依赖失败或编排中断，未能继续执行"
+            ),
+        )
+
+        await self._finalize_task_plan_todo(sub_tasks)
+        if callable(stream_event_sink):
+            await stream_event_sink({"type": "todo_completed"})
+        self._persist_task_plan_result(
+            message,
+            sub_tasks,
+            results,
+            started_at=plan_started_at,
+            completed_at=datetime.now().isoformat(),
+            error_message=execution_error,
+            learning_usage_summary=learning_usage_summary,
+        )
+
+        # Build summary response
+        completed = sum(1 for task in sub_tasks if task.status == "completed")
+        failed = sum(1 for task in sub_tasks if task.status == "failed")
+        summary_parts: list[str] = []
+        if execution_error or failed:
+            summary_parts.append(
+                f"## 任务执行结束（成功 {completed} / 失败 {failed} / 共 {len(sub_tasks)} 个子任务）"
+            )
+        else:
+            summary_parts.append(f"## 任务执行完成 ({len(sub_tasks)} 个子任务)")
+        if execution_error:
+            summary_parts.append(f"\n### ⚠️ 编排异常\n**原因**: {execution_error[:500]}")
+        for st in sub_tasks:
+            result = results.get(st.id, "")
+            status_icon = "✅" if st.status == "completed" else "❌"
+            summary_parts.append(
+                f"\n### {status_icon} 子任务 {st.id}: {st.description}\n"
+                f"**工具**: {', '.join(st.required_tools) or '无'}  \n"
+                f"**结果**: {result[:500] if result else '（无输出）'}"
+            )
+
+        return "\n".join(summary_parts)
+
+    async def _cleanup_stale_todo_after_plan_fallback(
+        self,
+        session_id: str,
+        previous_plan_id: str | None,
+        *,
+        stream_event_sink: Any | None = None,
+    ) -> None:
+        """Cancel an unchanged restored todo before falling back to plain tool flow."""
+        if not session_id or not previous_plan_id:
+            return
+        try:
+            from ..tools.handlers.plan import cancel_todo, get_active_plan_id
+
+            active_plan_id = get_active_plan_id(session_id) or ""
+            if active_plan_id != previous_plan_id:
+                return
+            if not cancel_todo(session_id):
+                return
+            logger.info(
+                "[TaskPlan] Cancelled stale active todo %s before planner fallback for %s",
+                previous_plan_id,
+                session_id,
+            )
+            if callable(stream_event_sink):
+                await stream_event_sink(
+                    {
+                        "type": "todo_cancelled",
+                        "plan_id": previous_plan_id,
+                        "clear": True,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("[TaskPlan] Failed to cleanup stale todo on fallback: %s", exc)
+
+    async def _initialize_task_plan_todo(self, message: str, sub_tasks: list[SubTask]) -> None:
+        if not sub_tasks:
+            return
+        try:
+            await self.handler_registry.execute_by_tool(
+                "create_todo",
+                {
+                    "task_summary": message[:200],
+                    "steps": [
+                        {
+                            "id": task.id,
+                            "description": task.description,
+                            "depends_on": list(task.depends_on),
+                            "skills": [],
+                        }
+                        for task in sub_tasks
+                    ],
+                },
+            )
+        except Exception as exc:
+            logger.warning("[TaskPlan] Failed to initialize todo plan: %s", exc)
+
+    @staticmethod
+    def _build_required_todo_bootstrap_steps(message: str) -> list[dict[str, str]]:
+        summary = " ".join(str(message or "").strip().split())
+        if len(summary) > 120:
+            summary = summary[:117].rstrip() + "..."
+        task_line = summary or "执行当前用户请求"
+        return [
+            {"id": "step_1", "description": "分析任务目标并确认执行路径"},
+            {"id": "step_2", "description": f"执行任务：{task_line}"},
+            {"id": "step_3", "description": "整理结果并回复用户"},
+            {
+                "id": "step_4",
+                "description": (
+                    "审查：默认质疑前序步骤均未真正完成，核验结果、交付物、需求匹配与测试证据；"
+                    "未通过则继续下一轮 Todo。"
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _looks_like_review_sub_task(task: SubTask | dict[str, Any]) -> bool:
+        if isinstance(task, SubTask):
+            description = str(task.description or "").strip()
+        elif isinstance(task, dict):
+            description = str(task.get("description", "") or "").strip()
+        else:
+            return False
+        return description.startswith("审查：")
+
+    @staticmethod
+    def _append_task_plan_review_step(
+        sub_tasks: list[SubTask],
+        *,
+        task_message: str,
+    ) -> list[SubTask]:
+        normalized = canonicalize_sub_tasks(sub_tasks)
+        if any(Agent._looks_like_review_sub_task(task) for task in normalized):
+            return normalized
+
+        depends_on = [task.id for task in normalized]
+        review_task = SubTask(
+            id=f"step_{len(normalized) + 1}",
+            description=(
+                "审查：默认质疑前序任务均未真正完成，逐项核验完成状态、交付物、用户需求匹配、"
+                "是否存在幻觉或说谎式完成；涉及代码时确认已完成专业功能测试。"
+            ),
+            required_tools=[],
+            agent_profile="code" if any("code" in str(task.agent_profile) for task in normalized) else "default",
+            depends_on=depends_on,
+            estimated_complexity="high",
+        )
+        return canonicalize_sub_tasks([*normalized, review_task])
+
+    async def _ensure_required_todo_visible(
+        self,
+        *,
+        message: str,
+        session_id: str,
+        stream_event_sink: Any | None = None,
+    ) -> bool:
+        """Bootstrap or replay a visible Todo for todo-required non-planner turns."""
+        if not session_id:
+            return False
+
+        try:
+            from ..tools.handlers.plan import (
+                get_todo_handler_for_session,
+                has_active_todo,
+                is_todo_required,
+            )
+        except Exception as exc:
+            logger.debug("[Todo] visibility bootstrap import skipped: %s", exc)
+            return False
+
+        if not is_todo_required(session_id):
+            return False
+
+        handler = get_todo_handler_for_session(session_id)
+        plan = handler.get_plan_for(session_id) if handler else None
+        restored = plan is not None
+
+        if plan is None and not has_active_todo(session_id):
+            try:
+                await self.handler_registry.execute_by_tool(
+                    "create_todo",
+                    {
+                        "task_summary": str(message or "")[:200],
+                        "steps": self._build_required_todo_bootstrap_steps(message),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[Todo] Failed to bootstrap required todo: %s", exc)
+                return False
+            handler = get_todo_handler_for_session(session_id)
+            plan = handler.get_plan_for(session_id) if handler else None
+            restored = False
+
+        if plan is None:
+            return False
+
+        if callable(stream_event_sink):
+            try:
+                await stream_event_sink(
+                    {
+                        "type": "todo_created",
+                        "restored": restored,
+                        "plan": {
+                            "id": str(plan.get("id") or plan.get("plan_id") or "").strip(),
+                            "taskSummary": str(
+                                plan.get("task_summary")
+                                or plan.get("title")
+                                or plan.get("taskSummary")
+                                or str(message or "")[:200]
+                            ).strip(),
+                            "steps": [
+                                {
+                                    "id": str(step.get("id") or "").strip(),
+                                    "description": str(
+                                        step.get("description")
+                                        or step.get("content")
+                                        or step.get("label")
+                                        or step.get("id")
+                                        or ""
+                                    ).strip(),
+                                    "status": str(step.get("status") or "pending").strip(),
+                                }
+                                for step in (plan.get("steps", []) or [])
+                                if isinstance(step, dict)
+                            ],
+                            "status": str(plan.get("status") or "in_progress").strip(),
+                        },
+                    }
+                )
+            except Exception as exc:
+                logger.debug("[Todo] Failed to emit required todo snapshot: %s", exc)
+        return True
+
+    async def _handle_task_plan_step_status(
+        self,
+        sub_task: SubTask,
+        status: str,
+        meta: dict[str, Any],
+    ) -> None:
+        result_text = (sub_task.result or "").strip()
+        short_result = result_text[:240] if result_text else ""
+
+        try:
+            mapped_status = "in_progress" if status == "in_progress" else status
+            await self.handler_registry.execute_by_tool(
+                "update_todo_step",
+                {
+                    "step_id": sub_task.id,
+                    "status": mapped_status,
+                    "result": short_result or mapped_status,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[TaskPlan] Failed to update todo step %s: %s", sub_task.id, exc)
+
+        try:
+            gateway = session_gateway = None
+            session = getattr(self, "_current_session", None)
+            if session and hasattr(session, "get_metadata"):
+                session_gateway = session.get_metadata("_gateway")
+            gateway = session_gateway
+            if gateway and hasattr(gateway, "emit_progress_event") and session:
+                total_steps = int(meta.get("total_steps", 0) or 0)
+                completed_steps = int(meta.get("completed_steps", 0) or 0)
+                failed_steps = int(meta.get("failed_steps", 0) or 0)
+                if status == "in_progress":
+                    message = f"🚀 开始执行子任务 {sub_task.id}: {sub_task.description}"
+                else:
+                    icon = "✅" if status == "completed" else "❌"
+                    summary = short_result or "（无结果摘要）"
+                    message = (
+                        f"{icon} 子任务 {sub_task.id} 已{status}\n"
+                        f"进度: {completed_steps}/{total_steps} 完成，失败 {failed_steps}\n"
+                        f"摘要: {summary}"
+                    )
+                await gateway.emit_progress_event(session, message)
+        except Exception as exc:
+            logger.warning("[TaskPlan] Failed to emit plan progress: %s", exc)
+
+    async def _finalize_task_plan_todo(self, sub_tasks: list[SubTask]) -> None:
+        if not sub_tasks:
+            return
+        completed = sum(1 for task in sub_tasks if task.status == "completed")
+        failed = sum(1 for task in sub_tasks if task.status == "failed")
+        summary = f"子任务执行完成：成功 {completed} 个，失败 {failed} 个。"
+        try:
+            await self.handler_registry.execute_by_tool(
+                "complete_todo",
+                {"summary": summary},
+            )
+        except Exception as exc:
+            logger.warning("[TaskPlan] Failed to complete todo plan: %s", exc)
+
+    async def _mark_unresolved_task_plan_steps_failed(
+        self,
+        sub_tasks: list[SubTask],
+        results: dict[str, str],
+        *,
+        failure_reason: str,
+    ) -> None:
+        unresolved = [
+            task
+            for task in sub_tasks
+            if task.status not in {"completed", "failed", "skipped", "cancelled"}
+        ]
+        if not unresolved:
+            return
+
+        total_steps = len(sub_tasks)
+        for task in unresolved:
+            task.status = "failed"
+            task.result = (task.result or failure_reason).strip()[:500]
+            results[task.id] = results.get(task.id) or f"❌ Failed: {task.result}"
+            completed_steps = sum(1 for step in sub_tasks if step.status == "completed")
+            failed_steps = sum(1 for step in sub_tasks if step.status == "failed")
+            await self._handle_task_plan_step_status(
+                task,
+                "failed",
+                {
+                    "total_steps": total_steps,
+                    "completed_steps": completed_steps,
+                    "failed_steps": failed_steps,
+                },
+            )
+
+    def _persist_task_plan_result(
+        self,
+        message: str,
+        sub_tasks: list[SubTask],
+        results: dict[str, str],
+        *,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        error_message: str | None = None,
+        learning_usage_summary: dict[str, Any] | None = None,
+    ) -> None:
+        session = getattr(self, "_current_session", None)
+        context = getattr(session, "context", None) if session is not None else None
+        if session is None or context is None:
+            return
+
+        completed = sum(1 for task in sub_tasks if task.status == "completed")
+        failed = sum(1 for task in sub_tasks if task.status == "failed")
+        pending = sum(1 for task in sub_tasks if task.status not in {"completed", "failed"})
+        if failed and completed:
+            status = "partial_failed"
+        elif failed:
+            status = "failed"
+        else:
+            status = "completed"
+
+        step_summaries: list[dict[str, Any]] = []
+        for task in sub_tasks:
+            result_text = str(results.get(task.id, task.result or "") or "").strip()
+            step_summaries.append(
+                {
+                    "id": task.id,
+                    "description": task.description,
+                    "status": task.status,
+                    "agent_profile": task.agent_profile,
+                    "depends_on": list(task.depends_on),
+                    "required_tools": list(task.required_tools),
+                    "result_preview": result_text[:300],
+                }
+            )
+
+        record = {
+            "orchestration_id": uuid.uuid4().hex[:12],
+            "task_message": message[:500],
+            "status": status,
+            "total_steps": len(sub_tasks),
+            "completed_steps": completed,
+            "failed_steps": failed,
+            "pending_steps": pending,
+            "started_at": started_at or datetime.now().isoformat(),
+            "completed_at": completed_at or datetime.now().isoformat(),
+            "steps": step_summaries,
+        }
+        if error_message:
+            record["error_message"] = error_message[:500]
+        usage = dict(learning_usage_summary or {})
+        if isinstance(usage.get("used_actions"), list) and usage.get("used_actions"):
+            record["planning_learning_usage"] = usage
+        record["verification_summary"] = self._build_task_plan_verification_summary(record)
+        suggested_next_round_todo = record["verification_summary"].get("suggested_next_round_todo")
+        if isinstance(suggested_next_round_todo, dict) and suggested_next_round_todo.get("steps"):
+            record["next_round_todo"] = suggested_next_round_todo
+        planning_feedback_summary = self._record_candidate_action_feedback(record)
+        if planning_feedback_summary:
+            record["planning_feedback_summary"] = planning_feedback_summary
+        record["work_summary"] = self._build_orchestration_work_summary(record)
+        self._log_orchestration_outcome(record)
+
+        records = getattr(context, "orchestration_records", None)
+        if records is None:
+            context.orchestration_records = []
+            records = context.orchestration_records
+        records.append(record)
+        if len(records) > 30:
+            context.orchestration_records = records[-30:]
+
+        try:
+            session.set_metadata(
+                "last_orchestration_result",
+                {
+                    "orchestration_id": record["orchestration_id"],
+                    "task_message": record["task_message"],
+                    "status": record["status"],
+                    "total_steps": record["total_steps"],
+                    "completed_steps": record["completed_steps"],
+                    "failed_steps": record["failed_steps"],
+                    "pending_steps": record["pending_steps"],
+                    "completed_at": record["completed_at"],
+                    "verification_summary": dict(record.get("verification_summary", {}) or {}),
+                    "next_round_todo": dict(record.get("next_round_todo", {}) or {}),
+                    "planning_learning_usage": dict(record.get("planning_learning_usage", {}) or {}),
+                    "planning_feedback_summary": dict(record.get("planning_feedback_summary", {}) or {}),
+                    "work_summary": record["work_summary"],
+                },
+            )
+            session.set_metadata("_pending_orchestration_verification_id", record["orchestration_id"])
+        except Exception as exc:
+            logger.debug("[TaskPlan] Failed to persist orchestration metadata: %s", exc)
+
+        manager = getattr(session, "_manager", None)
+        if manager is not None:
+            try:
+                if hasattr(manager, "mark_dirty"):
+                    manager.mark_dirty()
+                if hasattr(manager, "persist"):
+                    manager.persist()
+            except Exception as exc:
+                logger.debug("[TaskPlan] Failed to persist session state: %s", exc)
+
+    @staticmethod
+    def _derive_candidate_action_credit(record: dict[str, Any]) -> tuple[str, float]:
+        verification = dict(record.get("verification_summary", {}) or {})
+        verification_status = str(verification.get("status", "") or "").strip().lower()
+        status = str(record.get("status", "") or "").strip().lower()
+        if status == "completed" and verification_status == "completed":
+            return "helpful", 1.0
+        if status == "failed":
+            return "harmful", -1.0
+        if status == "partial_failed" or verification_status == "incomplete":
+            return "harmful", -0.75
+        return "neutral", 0.0
+
+    def _record_candidate_action_feedback(self, record: dict[str, Any]) -> dict[str, Any]:
+        usage = dict(record.get("planning_learning_usage", {}) or {})
+        used_actions = [
+            item
+            for item in (usage.get("used_actions", []) or [])
+            if isinstance(item, dict) and str(item.get("target_id", "") or "").strip()
+        ]
+        if not used_actions:
+            return {}
+
+        try:
+            from ..learning.store import LearningStore
+
+            store = LearningStore()
+            recorded_hits = store.record_candidate_action_hits(
+                used_actions,
+                query=str(record.get("task_message", "") or "")[:500],
+                source="task_planner",
+            )
+            outcome, score = self._derive_candidate_action_credit(record)
+            recorded_credit = 0
+            for item in used_actions:
+                target_id = str(item.get("target_id", "") or "").strip()
+                if not target_id:
+                    continue
+                hit_count = store.get_hit_count("candidate_action", target_id)
+                store.record_credit_observation(
+                    target_type="candidate_action",
+                    target_id=target_id,
+                    outcome=outcome,
+                    source="orchestration_result",
+                    score=score,
+                    hit_count=hit_count,
+                    related_case_id=str(item.get("case_id", "") or ""),
+                    context_ref=str(record.get("orchestration_id", "") or ""),
+                )
+                recorded_credit += 1
+            return {
+                "recorded_hit_count": recorded_hits,
+                "recorded_credit_count": recorded_credit,
+                "credit_outcome": outcome,
+                "credit_score": score,
+            }
+        except Exception as exc:
+            logger.debug("[TaskPlan] Failed to record candidate-action feedback: %s", exc)
+            return {}
+
+    @staticmethod
+    def _build_orchestration_work_summary(record: dict[str, Any]) -> str:
+        task = str(record.get("task_message", "") or "").strip()
+        status = str(record.get("status", "") or "")
+        total_steps = int(record.get("total_steps", 0) or 0)
+        completed_steps = int(record.get("completed_steps", 0) or 0)
+        failed_steps = int(record.get("failed_steps", 0) or 0)
+        pending_steps = int(record.get("pending_steps", 0) or 0)
+        icon = "✅" if status == "completed" else ("⚠️" if status == "partial_failed" else "❌")
+        lines = [
+            f"[主编排] 任务: {task}",
+            (
+                f"状态: {icon} {status or 'unknown'} | 步骤: {completed_steps}/{total_steps} 完成"
+                f" | 失败: {failed_steps} | 待处理: {pending_steps}"
+            ),
+        ]
+        verification = record.get("verification_summary", {}) or {}
+        verification_status = str(verification.get("status", "") or "").strip()
+        if verification_status:
+            verification_icon = "✅" if verification_status == "completed" else "⚠️"
+            verification_reason = str(verification.get("reason", "") or "").strip()
+            verification_source = str(verification.get("decision_source", "") or "").strip()
+            detail = verification_reason or verification_source or "无"
+            lines.append(
+                f"验收: {verification_icon} {verification_status} | 依据: {detail[:180]}"
+            )
+        steps = record.get("steps", []) or []
+        if steps:
+            highlights = []
+            for step in steps[:4]:
+                step_id = step.get("id", "?")
+                step_status = step.get("status", "unknown")
+                desc = str(step.get("description", "") or "").strip()
+                highlights.append(f"{step_id}:{step_status}:{desc}")
+            lines.append("阶段摘要: " + " ; ".join(highlights))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_step_result_payload(result_preview: str) -> Any | None:
+        preview = str(result_preview or "").strip()
+        if not preview:
+            return None
+        try:
+            return json.loads(preview)
+        except Exception:
+            pass
+        try:
+            return ast.literal_eval(preview)
+        except Exception:
+            return None
+
+    @classmethod
+    def _extract_delivery_state_counts(cls, record: dict[str, Any]) -> dict[str, int]:
+        counts = {"delivered": 0, "local_only": 0, "failed": 0}
+
+        def _merge(summary: dict[str, Any]) -> None:
+            for key in counts:
+                counts[key] += int(summary.get(key, 0) or 0)
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                summary_found = False
+                for key in ("delivery_state_summary", "_delivery_state_summary"):
+                    summary = node.get(key)
+                    if isinstance(summary, dict):
+                        _merge(summary)
+                        summary_found = True
+                state = str(node.get("delivery_state", "") or "").strip()
+                if state in counts and not summary_found:
+                    counts[state] += 1
+                for value in node.values():
+                    _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        for step in (record.get("steps", []) or []):
+            if not isinstance(step, dict):
+                continue
+            payload = cls._parse_step_result_payload(str(step.get("result_preview", "") or ""))
+            if payload is not None:
+                _walk(payload)
+        return counts
+
+    @classmethod
+    def _derive_orchestration_business_outcome(
+        cls,
+        record: dict[str, Any],
+        verification: dict[str, Any],
+        delivery_counts: dict[str, int],
+    ) -> str:
+        status = str(record.get("status", "") or "").strip().lower()
+        verification_status = str(verification.get("status", "") or "").strip().lower()
+        review_passed = verification.get("review_passed")
+        delivery_verified = verification.get("delivery_verified")
+        next_round = dict(record.get("next_round_todo", {}) or {})
+
+        if verification_status == "completed" and status == "completed":
+            return "passed"
+        if review_passed is False:
+            return "failed_review"
+        if delivery_verified is False or delivery_counts.get("local_only", 0) > 0:
+            return "delivery_unverified"
+        if delivery_counts.get("failed", 0) > 0:
+            return "delivery_failed"
+        if next_round.get("steps"):
+            return "needs_follow_up"
+        if status == "partial_failed":
+            return "partial_failed"
+        if status == "failed":
+            return "failed"
+        return "incomplete"
+
+    def _log_orchestration_outcome(self, record: dict[str, Any]) -> None:
+        verification = dict(record.get("verification_summary", {}) or {})
+        feedback = dict(record.get("planning_feedback_summary", {}) or {})
+        usage = dict(record.get("planning_learning_usage", {}) or {})
+        next_round = dict(record.get("next_round_todo", {}) or {})
+        delivery_counts = self._extract_delivery_state_counts(record)
+        business_outcome = self._derive_orchestration_business_outcome(
+            record,
+            verification,
+            delivery_counts,
+        )
+        next_round_steps = len(next_round.get("steps", []) or [])
+        summary = (
+            "[OrchestrationOutcome] id=%s status=%s verification=%s outcome=%s "
+            "review_passed=%s delivery_verified=%s next_round_steps=%s "
+            "used_actions=%s credit_outcome=%s delivery=%s"
+        )
+        logger.info(
+            summary,
+            str(record.get("orchestration_id", "") or ""),
+            str(record.get("status", "") or ""),
+            str(verification.get("status", "") or ""),
+            business_outcome,
+            verification.get("review_passed"),
+            verification.get("delivery_verified"),
+            next_round_steps,
+            int(usage.get("used_action_count", 0) or 0),
+            str(feedback.get("credit_outcome", "") or ""),
+            delivery_counts,
+        )
+        if business_outcome in {"failed_review", "delivery_unverified", "delivery_failed"}:
+            logger.warning(
+                "[OrchestrationRisk] id=%s outcome=%s reason=%s missing_deliverables=%s next_round_steps=%s delivery=%s",
+                str(record.get("orchestration_id", "") or ""),
+                business_outcome,
+                str(verification.get("reason", "") or ""),
+                list(verification.get("missing_deliverables", []) or []),
+                next_round_steps,
+                delivery_counts,
+            )
+
+    @staticmethod
+    def _build_task_plan_verification_summary(record: dict[str, Any]) -> dict[str, Any]:
+        from ..tools.handlers.todo_review import build_next_round_todo, parse_review_result
+
+        status = str(record.get("status", "") or "").strip().lower()
+        total_steps = int(record.get("total_steps", 0) or 0)
+        completed_steps = int(record.get("completed_steps", 0) or 0)
+        failed_steps = int(record.get("failed_steps", 0) or 0)
+        pending_steps = int(record.get("pending_steps", 0) or 0)
+        task_message = str(record.get("task_message", "") or "").strip()
+        error_message = str(record.get("error_message", "") or "").strip()
+        steps = [step for step in (record.get("steps", []) or []) if isinstance(step, dict)]
+        delivery_keywords = (
+            "推送",
+            "发送",
+            "发给",
+            "发到",
+            "交付",
+            "上传",
+            "回复",
+            "二维码",
+            "附件",
+            "图片",
+            "文件",
+        )
+        delivery_tool_names = {"deliver_artifacts", "org_submit_deliverable", "org_accept_deliverable"}
+        requires_delivery_evidence = any(keyword in task_message for keyword in delivery_keywords) or any(
+            tool_name in delivery_tool_names
+            for step in steps
+            for tool_name in (step.get("required_tools", []) or [])
+        )
+        has_successful_delivery_step = any(
+            str(step.get("status", "") or "") == "completed"
+            and any(tool_name in delivery_tool_names for tool_name in (step.get("required_tools", []) or []))
+            for step in steps
+        )
+        review_steps = [
+            step
+            for step in steps
+            if str(step.get("description", "") or "").strip().startswith("审查：")
+        ]
+        review_completed = any(str(step.get("status", "") or "").strip() == "completed" for step in review_steps)
+        latest_review_step = review_steps[-1] if review_steps else {}
+        code_keywords = (
+            "代码",
+            "开发",
+            "实现",
+            "修复",
+            "bug",
+            "功能",
+            "接口",
+            "api",
+            "python",
+            "typescript",
+            "javascript",
+            "rust",
+            "java",
+            "go",
+            "前端",
+            "后端",
+        )
+        task_and_steps = " ".join(
+            [
+                task_message,
+                *[
+                    " ".join(
+                        [
+                            (
+                                ""
+                                if str(step.get("description", "") or "").strip().startswith("审查：")
+                                else str(step.get("description", "") or "")
+                            ),
+                            " ".join(str(tool) for tool in (step.get("required_tools", []) or [])),
+                        ]
+                    )
+                    for step in steps
+                ],
+            ]
+        ).lower()
+        code_task_detected = any(keyword in task_and_steps for keyword in code_keywords)
+        review_summary = parse_review_result(
+            str(latest_review_step.get("result_preview", "") or ""),
+            requires_code_test=code_task_detected,
+            requires_delivery=requires_delivery_evidence,
+        )
+        review_passed = bool(review_summary.get("passed"))
+        strong_test_keywords = (
+            "pytest",
+            "单元测试",
+            "集成测试",
+            "功能测试",
+            "回归测试",
+            "e2e",
+            "diagnostic",
+            "diagnostics",
+            "ruff",
+            "mypy",
+            "getdiagnostics",
+        )
+        action_keywords = ("运行", "执行", "完成", "已跑", "已运行", "已执行", "通过")
+        test_keywords = ("测试", "验证", "诊断")
+        negative_test_markers = ("没有测试", "未测试", "未记录测试", "缺少测试", "没有写测试")
+
+        def _step_test_signal(step: dict[str, Any]) -> str:
+            description = str(step.get("description", "") or "").strip()
+            if description.startswith("审查："):
+                description = ""
+            return " ".join(
+                [
+                    description,
+                    str(step.get("result_preview", "") or ""),
+                    " ".join(str(tool) for tool in (step.get("required_tools", []) or [])),
+                ]
+            ).lower()
+
+        has_test_evidence = any(
+            (
+                any(
+                    keyword in _step_test_signal(step)
+                    for keyword in strong_test_keywords
+                )
+                or (
+                    not any(
+                        marker in _step_test_signal(step)
+                        for marker in negative_test_markers
+                    )
+                    and any(
+                        keyword in _step_test_signal(step)
+                        for keyword in action_keywords
+                    )
+                    and any(
+                        keyword in _step_test_signal(step)
+                        for keyword in test_keywords
+                    )
+                )
+            )
+            for step in steps
+        )
+        structured_test_verified = False
+        test_evidence = review_summary.get("test_evidence")
+        if isinstance(test_evidence, dict) and test_evidence.get("verified") is True:
+            evidence_step_ids = [
+                str(item).strip()
+                for item in (test_evidence.get("evidence_step_ids") or [])
+                if str(item).strip()
+            ]
+            if evidence_step_ids:
+                completed_step_ids = {
+                    str(step.get("id", "") or "").strip()
+                    for step in steps
+                    if not str(step.get("description", "") or "").strip().startswith("审查：")
+                    and str(step.get("status", "") or "").strip() == "completed"
+                }
+                structured_test_verified = all(step_id in completed_step_ids for step_id in evidence_step_ids)
+            else:
+                structured_test_verified = True
+        has_test_evidence = has_test_evidence or structured_test_verified
+        delivery_verified = review_summary.get("delivery_verified")
+        missing_deliverables = [
+            str(item).strip()
+            for item in (review_summary.get("missing_deliverables") or [])
+            if str(item).strip()
+        ]
+
+        if error_message:
+            summary_status = "incomplete"
+            reason = f"编排执行异常: {error_message[:180]}"
+        elif failed_steps > 0:
+            summary_status = "incomplete"
+            reason = f"存在 {failed_steps} 个失败子任务"
+        elif pending_steps > 0:
+            summary_status = "incomplete"
+            reason = f"仍有 {pending_steps} 个未完成子任务"
+        elif not review_steps:
+            summary_status = "incomplete"
+            reason = "缺少最终审查步骤"
+        elif not review_completed:
+            summary_status = "incomplete"
+            reason = "最终审查尚未完成"
+        elif not review_passed:
+            summary_status = "incomplete"
+            reason = "最终审查未明确通过"
+        elif requires_delivery_evidence and delivery_verified is False:
+            summary_status = "incomplete"
+            reason = "最终审查确认交付未核验通过"
+        elif missing_deliverables:
+            summary_status = "incomplete"
+            reason = "最终审查识别到缺少交付物"
+        elif code_task_detected and not has_test_evidence:
+            summary_status = "incomplete"
+            reason = "代码任务缺少测试或诊断证据"
+        elif requires_delivery_evidence and not has_successful_delivery_step:
+            summary_status = "incomplete"
+            reason = "任务要求交付，但没有成功的交付步骤"
+        elif status == "completed" and completed_steps >= total_steps and total_steps > 0:
+            summary_status = "completed"
+            reason = "所有子任务已完成并满足执行态验收"
+        else:
+            summary_status = "incomplete"
+            reason = "编排执行未形成明确完成证据"
+
+        suggested_next_round_todo: dict[str, Any] = {}
+        if summary_status != "completed":
+            blockers = [reason]
+            blockers.extend(
+                str(item).strip()
+                for item in (review_summary.get("blockers") or [])
+                if str(item).strip()
+            )
+            failed_step_bits = []
+            for step in steps:
+                if str(step.get("status", "") or "").strip() != "failed":
+                    continue
+                desc = str(step.get("description", "") or step.get("id") or "").strip()
+                if desc:
+                    failed_step_bits.append(f"修复失败步骤：{desc}")
+            blockers.extend(failed_step_bits[:3])
+            suggested_next_round_todo = build_next_round_todo(
+                {
+                    "id": str(record.get("orchestration_id", "") or "").strip(),
+                    "task_summary": task_message,
+                    "steps": steps,
+                },
+                blockers=list(dict.fromkeys(blockers)),
+                review_summary=review_summary,
+            )
+
+        return {
+            "status": summary_status,
+            "decision_source": "orchestration_execution",
+            "reason": reason,
+            "total_steps": total_steps,
+            "completed_steps": completed_steps,
+            "failed_steps": failed_steps,
+            "pending_steps": pending_steps,
+            "requires_delivery_evidence": requires_delivery_evidence,
+            "has_successful_delivery_step": has_successful_delivery_step,
+            "has_review_step": bool(review_steps),
+            "review_completed": review_completed,
+            "review_passed": review_passed,
+            "review_summary": review_summary,
+            "code_task_detected": code_task_detected,
+            "has_test_evidence": has_test_evidence,
+            "delivery_verified": delivery_verified,
+            "missing_deliverables": missing_deliverables,
+            "suggested_next_round_todo": suggested_next_round_todo,
+        }
 
     async def _preempt_or_queue_prev_task(
         self,
@@ -10213,6 +11600,19 @@ class Agent:
                 await plan_handler._store.flush()
         except Exception as e:
             logger.debug(f"[TodoStore] Shutdown flush failed: {e}")
+
+        # 显式关闭当前 Agent 自有的浏览器资源，避免 Playwright/Chrome
+        # transport 在事件循环已关闭后才由 __del__ 被动回收。
+        browser_manager = _get_owned_browser_manager(self)
+        if browser_manager and hasattr(browser_manager, "stop"):
+            try:
+                await browser_manager.stop()
+            except Exception as e:
+                logger.warning(f"Browser shutdown error: {e}")
+        self.browser_manager = None
+        self.pw_tools = None
+        if hasattr(self, "bu_runner"):
+            self.bu_runner = None
 
         # 如果当前 Agent 是进程主 Agent，则清理引用，防止后续 sub-agent
         # 拿到已经 shutdown 的 parent。

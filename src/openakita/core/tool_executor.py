@@ -1446,8 +1446,13 @@ class ToolExecutor:
                         rs = parsed.get("receipts") if isinstance(parsed, dict) else None
                         if isinstance(rs, list) and rs:
                             receipts = rs
+                            tool_result_payload = parsed if isinstance(parsed, dict) else {}
+                        else:
+                            tool_result_payload = {}
                     except Exception:
-                        pass
+                        tool_result_payload = {}
+                else:
+                    tool_result_payload = {}
 
             except ToolSkipped as e:
                 skip_reason = e.reason or "用户请求跳过"
@@ -1515,6 +1520,13 @@ class ToolExecutor:
             # are dropped, but we still pop explicitly to avoid drift.
             if hint is not None:
                 tool_result["_hint"] = hint
+            if receipts:
+                tool_result["_delivery_receipts"] = receipts
+                tool_result["delivery_receipt_count"] = len(receipts)
+            if isinstance(tool_result_payload, dict):
+                state_summary = tool_result_payload.get("delivery_state_summary")
+                if isinstance(state_summary, dict):
+                    tool_result["_delivery_state_summary"] = dict(state_summary)
 
             return idx, tool_result, tool_name if success else None, receipts
 

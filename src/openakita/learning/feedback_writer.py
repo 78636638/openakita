@@ -44,6 +44,25 @@ class MemoryFeedbackWriter:
             detail_lines.append(f"缺口: {case.harness_gap}")
         if case.evidence:
             detail_lines.append(f"证据: {case.evidence[0]}")
+        if case.candidate_actions:
+            next_actions = [
+                str(action.get("description", "") or "").strip()
+                for action in case.candidate_actions[:3]
+                if isinstance(action, dict) and str(action.get("description", "") or "").strip()
+            ]
+            if next_actions:
+                detail_lines.append("补救计划: " + "；".join(next_actions))
+        tool_metadata_summary = {}
+        if isinstance(case.lineage, dict):
+            tool_metadata_summary = dict(case.lineage.get("tool_metadata_summary", {}) or {})
+        if tool_metadata_summary:
+            detail_lines.append(
+                "工具证据: "
+                f"tool_results={int(tool_metadata_summary.get('tool_result_count', 0) or 0)}, "
+                f"errors={int(tool_metadata_summary.get('error_tool_count', 0) or 0)}, "
+                f"receipts={int(tool_metadata_summary.get('delivery_receipt_count', 0) or 0)}, "
+                f"delivery={tool_metadata_summary.get('delivery_state_counts', {}) or {}}"
+            )
         detail_lines.append(f"重复次数: {repeat_count}")
 
         importance = 0.85 if case.severity == "high" else 0.65

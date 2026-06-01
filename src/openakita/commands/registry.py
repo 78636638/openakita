@@ -59,6 +59,10 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("memory", "记忆信息", "查看 Agent 记忆", scope=CommandScope.CLI),
     CommandDef("skills", "技能列表", "查看已安装技能", scope=CommandScope.CLI),
     CommandDef("channels", "IM 通道", "查看 IM 通道状态", scope=CommandScope.CLI),
+    CommandDef("turns", "Turn 摘要", "查看当前会话最近的 Turn 摘要", scope=CommandScope.CLI),
+    CommandDef("turn", "Turn 详情", "查看指定 Turn 的详情快照", args_hint="<序号>", scope=CommandScope.CLI),
+    CommandDef("expand", "展开 Turn", "展开指定 Turn，并在 /turns 中持续显示详情", args_hint="<序号>", scope=CommandScope.CLI),
+    CommandDef("collapse", "折叠 Turn", "折叠指定 Turn，恢复摘要视图", args_hint="<序号>", scope=CommandScope.CLI),
     CommandDef("sessions", "会话列表", "查看 CLI 历史会话", scope=CommandScope.CLI),
     CommandDef(
         "session", "切换会话", "切换到指定的 CLI 会话", args_hint="<#>", scope=CommandScope.CLI

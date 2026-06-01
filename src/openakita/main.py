@@ -26,7 +26,14 @@ from rich.table import Table
 
 from .config import settings
 from .core.agent import Agent
-from .logging import setup_logging
+from .logging import (
+    add_console_suppression_filter,
+    quiet_logger_family_on_console,
+    remove_named_logger_console_handlers,
+    set_console_log_level,
+    set_named_logger_level,
+    setup_logging,
+)
 
 # MCP stdio 子进程模式：stdout 专属 JSONRPC 协议，禁止一切控制台日志输出
 _is_mcp_subprocess = "run-mcp-module" in sys.argv
@@ -43,6 +50,12 @@ setup_logging(
     log_to_file=settings.log_to_file,
 )
 logger = logging.getLogger(__name__)
+
+
+def _startup_shutdown_requested(shutdown_event: asyncio.Event | None) -> bool:
+    from openakita import config as cfg
+
+    return bool(getattr(cfg, "_restart_requested", False) or (shutdown_event and shutdown_event.is_set()))
 
 
 # ── Windows asyncio Proactor 噪音抑制（logging 层兜底）──
@@ -364,6 +377,20 @@ async def start_im_channels(agent_or_master):
     核心服务（SessionManager、AgentPool、Orchestrator）由 init_core_services() 负责。
     """
     global _message_gateway
+
+    if _message_gateway is not None and getattr(_message_gateway, "_running", False):
+        if _orchestrator is not None:
+            _orchestrator.set_gateway(_message_gateway)
+            _message_gateway.set_orchestrator(_orchestrator)
+        _setup_session_backfill(agent_or_master)
+        logger.info("IM channels already running, reusing existing MessageGateway")
+        return _message_gateway.get_started_adapters()
+
+    if _message_gateway is not None:
+        logger.warning("Found stale MessageGateway before IM startup, stopping it first")
+        with contextlib.suppress(Exception):
+            await _message_gateway.stop()
+        _message_gateway = None
 
     any_enabled = (
         settings.telegram_enabled
@@ -763,6 +790,7 @@ async def stop_im_channels(*, graceful: bool = True, drain_timeout: float = 30.0
         else:
             await _message_gateway.stop()
         logger.info("MessageGateway stopped")
+        _message_gateway = None
 
     if _desktop_pool:
         try:
@@ -781,6 +809,22 @@ async def stop_im_channels(*, graceful: bool = True, drain_timeout: float = 30.0
     if _session_manager:
         await _session_manager.stop()
         logger.info("SessionManager stopped")
+        _session_manager = None
+
+
+async def _shutdown_interactive_agent(agent: Agent | None) -> None:
+    """Release the interactive root agent before the event loop closes."""
+    global _agent
+    if agent is None:
+        return
+    try:
+        if getattr(agent, "is_initialized", False):
+            await agent.shutdown(task_description="interactive_cli_shutdown", success=True)
+    except Exception as e:
+        logger.warning(f"Interactive agent shutdown error: {e}")
+    finally:
+        if _agent is agent:
+            _agent = None
 
 
 def print_welcome():
@@ -801,6 +845,10 @@ def print_welcome():
 - `/help` - 显示帮助
 - `/status` - 显示状态
 - `/selfcheck` - 运行自检
+- `/turns` - 查看最近 Turn 摘要
+- `/turn <序号>` - 查看指定 Turn 详情
+- `/expand <序号>` - 展开指定 Turn
+- `/collapse <序号>` - 折叠指定 Turn
 - `/clear` - 清空对话
 - `/exit` 或 `/quit` - 退出
 """
@@ -820,6 +868,10 @@ def print_help():
         ("/memory", "显示记忆状态"),
         ("/skills", "列出已安装技能"),
         ("/channels", "显示 IM 通道状态"),
+        ("/turns", "查看当前会话最近的 Turn 摘要"),
+        ("/turn <序号>", "查看指定 Turn 的详情快照"),
+        ("/expand <序号>", "展开指定 Turn，并在 /turns 中持续显示详情"),
+        ("/collapse <序号>", "折叠指定 Turn，恢复摘要视图"),
         ("/agents", "显示 Agent 协同状态 (协同模式)"),
         ("/clear", "清空对话历史"),
         ("/exit, /quit", "退出程序"),
@@ -872,10 +924,136 @@ def show_channels():
         console.print(f"\n[green]活跃适配器:[/green] {', '.join(adapters) if adapters else '无'}")
 
 
+def _truncate_turn_archive_text(text: str, limit: int = 32) -> str:
+    value = " ".join(str(text or "").strip().split())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _turn_archive_expand_limit() -> int:
+    return 3
+
+
+def _print_turn_archive_summary(
+    console,
+    turn_archive: list[dict],
+    expanded_turns: set[int] | None = None,
+) -> None:
+    from .cli.stream_renderer import _build_archived_turn_detail_renderable_from_record
+    from rich.table import Table
+
+    if not turn_archive:
+        console.print("[yellow]当前会话还没有可查看的 Turn 摘要[/yellow]")
+        return
+
+    expanded_turns = set(expanded_turns or set())
+    expanded_records = sorted(
+        (
+            record
+            for record in turn_archive
+            if int(record.get("turn_index", 0) or 0) in expanded_turns
+        ),
+        key=lambda record: int(record.get("turn_index", 0) or 0),
+        reverse=True,
+    )
+
+    title = "最近 Turn 摘要"
+    if expanded_records:
+        title = f"{title} (已展开 {len(expanded_records)} 项)"
+
+    table = Table(title=title)
+    table.add_column("#", style="cyan", width=5, justify="right")
+    table.add_column("状态", style="green", width=12)
+    table.add_column("视图", style="yellow", width=10)
+    table.add_column("用户问题", style="blue", width=22, overflow="ellipsis", no_wrap=True)
+    table.add_column("结果摘要", style="magenta", width=24, overflow="ellipsis", no_wrap=True)
+    table.add_column("任务进度", style="yellow", width=16, overflow="ellipsis", no_wrap=True)
+
+    for record in reversed(turn_archive):
+        turn_index = int(record.get("turn_index", 0) or 0)
+        expanded = "已展开" if turn_index in expanded_turns else "摘要"
+        table.add_row(
+            str(turn_index or "-"),
+            str(record.get("status") or "").strip("`"),
+            expanded,
+            _truncate_turn_archive_text(record.get("user_input") or ""),
+            _truncate_turn_archive_text(record.get("result_summary") or ""),
+            _truncate_turn_archive_text(record.get("todo_summary") or ""),
+        )
+    console.print(table)
+    if not expanded_records:
+        return
+    expanded_ids = ", ".join(f"#{int(record.get('turn_index', 0) or 0)}" for record in expanded_records)
+    console.print(f"[dim]当前已展开 {len(expanded_records)} 项: {expanded_ids}[/dim]")
+    for record in expanded_records:
+        console.print(_build_archived_turn_detail_renderable_from_record(record))
+
+
+def _find_turn_archive_record(turn_archive: list[dict], turn_index: int) -> dict | None:
+    for record in turn_archive:
+        if int(record.get("turn_index", 0) or 0) == turn_index:
+            return record
+    return None
+
+
+def _print_turn_archive_detail(console, turn_archive: list[dict], turn_index: int) -> None:
+    from .cli.stream_renderer import _build_archived_turn_detail_renderable_from_record
+
+    record = _find_turn_archive_record(turn_archive, turn_index)
+    if not record:
+        console.print(f"[red]未找到 Turn #{turn_index}，可先使用 /turns 查看可用序号[/red]")
+        return
+    console.print(_build_archived_turn_detail_renderable_from_record(record))
+
+
+def _set_turn_archive_expanded(
+    turn_archive: list[dict],
+    expanded_turns: set[int],
+    turn_index: int,
+    *,
+    expanded: bool,
+) -> tuple[bool, bool, tuple[int, ...]]:
+    if not _find_turn_archive_record(turn_archive, turn_index):
+        return False, False, ()
+    if expanded:
+        already = turn_index in expanded_turns
+        if not already and len(expanded_turns) >= _turn_archive_expand_limit():
+            return False, False, tuple(sorted(expanded_turns, reverse=True))
+        expanded_turns.add(turn_index)
+        return True, not already, ()
+    already = turn_index in expanded_turns
+    expanded_turns.discard(turn_index)
+    return True, already, ()
+
+
 async def run_interactive():
     """运行交互式 CLI（同时启动 IM 通道）"""
     import signal as _signal
 
+    def _quiet_lark_console_noise() -> None:
+        quiet_logger_family_on_console(("Lark", "lark_oapi"), logging.ERROR)
+
+    # 交互模式下将终端日志降噪到 ERROR，避免预算/LLM/Memory/Policy 等运行日志
+    # 与 Rich 面板混在一起；文件日志和会话日志仍保持完整。
+    set_console_log_level(logging.ERROR)
+    # Lark SDK 在导入时会给 "Lark" logger 绑定 stdout handler，这会绕过 root
+    # logger 的终端降噪；这里提前导入并移除该 handler，保留向文件日志传播。
+    try:
+        importlib.import_module("lark_oapi.core.log")
+    except Exception:
+        pass
+    remove_named_logger_console_handlers("Lark")
+    # 同时压低其 logger 级别，避免 SDK 子模块再把 INFO/WARNING 打到终端。
+    set_named_logger_level("Lark", logging.ERROR)
+    set_named_logger_level("lark_oapi", logging.ERROR)
+    add_console_suppression_filter(
+        (
+            r"processor not found, type: im\.message\.message_read_v1",
+        ),
+        logger_prefixes=("Lark", "lark_oapi"),
+    )
+    _quiet_lark_console_noise()
     print_welcome()
 
     shutdown_event = asyncio.Event()
@@ -954,6 +1132,7 @@ async def run_interactive():
         async def _start_im_bg():
             try:
                 channels = await start_im_channels(agent)
+                _quiet_lark_console_noise()
                 if channels:
                     console.print(f"[green]✓[/green] IM 通道已启动: {', '.join(channels)}")
             except Exception as e:
@@ -1002,6 +1181,10 @@ async def run_interactive():
         "memory",
         "skills",
         "channels",
+        "turns",
+        "turn",
+        "expand",
+        "collapse",
         "clear",
         "sessions",
         "session",
@@ -1014,9 +1197,13 @@ async def run_interactive():
         if CommandScope.CLI in c.scope and c.name in _cli_handled
     ]
     pt_session, _completer = create_cli_session(commands=cli_commands)
+    turn_counter = 0
+    turn_archive: list[dict] = []
+    expanded_turns: set[int] = set()
 
     async def _process_message(user_input: str):
         """Process a single user message (extracted for early-input replay)."""
+        nonlocal turn_counter
         _active_session = getattr(agent_or_master, "_cli_session", None)
 
         if _active_session:
@@ -1028,13 +1215,24 @@ async def run_interactive():
             session_messages = []
 
         _sid = _active_session.id if _active_session else _cli_chat_id
+        turn_counter += 1
+        turn_id = f"{_sid}:turn:{turn_counter}"
         event_stream = agent_or_master.chat_with_session_stream(
             message=user_input,
             session_messages=session_messages,
             session_id=_sid,
             session=_active_session,
         )
-        reply_text = await render_stream(event_stream, console, agent_name=agent_name)
+        reply_text = await render_stream(
+            event_stream,
+            console,
+            agent_name=agent_name,
+            initial_status="消息已提交，正在分析并调度任务...",
+            turn_id=turn_id,
+            turn_index=turn_counter,
+            user_input=user_input,
+            turn_archive=turn_archive,
+        )
 
         if _active_session and reply_text:
             _meta: dict = {}
@@ -1116,6 +1314,89 @@ async def run_interactive():
                         show_channels()
                         continue
 
+                    elif cmd == "/turns":
+                        _print_turn_archive_summary(console, turn_archive, expanded_turns)
+                        continue
+
+                    elif cmd == "/turn":
+                        console.print("[yellow]用法: /turn <序号>[/yellow]")
+                        continue
+
+                    elif cmd.startswith("/turn "):
+                        parts = cmd.split(maxsplit=1)
+                        if len(parts) == 2:
+                            try:
+                                turn_index = int(parts[1])
+                                _print_turn_archive_detail(console, turn_archive, turn_index)
+                            except ValueError:
+                                console.print("[red]请输入有效的 Turn 序号[/red]")
+                        continue
+
+                    elif cmd == "/expand":
+                        console.print("[yellow]用法: /expand <序号>[/yellow]")
+                        continue
+
+                    elif cmd.startswith("/expand "):
+                        parts = cmd.split(maxsplit=1)
+                        if len(parts) == 2:
+                            try:
+                                turn_index = int(parts[1])
+                                found, changed, blocked_by = _set_turn_archive_expanded(
+                                    turn_archive, expanded_turns, turn_index, expanded=True
+                                )
+                                if not found and blocked_by:
+                                    blocked_text = ", ".join(f"#{item}" for item in blocked_by)
+                                    console.print(
+                                        "[yellow]"
+                                        f"最多只能同时展开 {_turn_archive_expand_limit()} 项；"
+                                        f"当前已展开 {blocked_text}。"
+                                        f"请先使用 /collapse <序号> 收起其中一项，再执行 /expand {turn_index}。"
+                                        "[/yellow]"
+                                    )
+                                elif not found:
+                                    console.print(
+                                        f"[red]未找到 Turn #{turn_index}，可先使用 /turns 查看可用序号[/red]"
+                                    )
+                                else:
+                                    message = (
+                                        f"[green]已展开 Turn #{turn_index}[/green]"
+                                        if changed
+                                        else f"[yellow]Turn #{turn_index} 已处于展开状态[/yellow]"
+                                    )
+                                    console.print(message)
+                                    _print_turn_archive_summary(console, turn_archive, expanded_turns)
+                            except ValueError:
+                                console.print("[red]请输入有效的 Turn 序号[/red]")
+                        continue
+
+                    elif cmd == "/collapse":
+                        console.print("[yellow]用法: /collapse <序号>[/yellow]")
+                        continue
+
+                    elif cmd.startswith("/collapse "):
+                        parts = cmd.split(maxsplit=1)
+                        if len(parts) == 2:
+                            try:
+                                turn_index = int(parts[1])
+                                found, changed, _blocked_by = _set_turn_archive_expanded(
+                                    turn_archive, expanded_turns, turn_index, expanded=False
+                                )
+                                if not found:
+                                    console.print(
+                                        f"[red]未找到 Turn #{turn_index}，可先使用 /turns 查看可用序号[/red]"
+                                    )
+                                else:
+                                    message = (
+                                        f"[green]已折叠 Turn #{turn_index}[/green]"
+                                        if changed
+                                        else f"[yellow]Turn #{turn_index} 当前已是摘要视图[/yellow]"
+                                    )
+                                    console.print(message)
+                                    _print_turn_archive_summary(console, turn_archive, expanded_turns)
+                            except ValueError:
+                                console.print("[red]请输入有效的 Turn 序号[/red]")
+                        continue
+
                     elif cmd == "/clear":
                         _new_id = f"cli_{_uuid.uuid4().hex[:12]}"
                         if _session_manager:
@@ -1146,6 +1427,9 @@ async def run_interactive():
                         _cli_session_file.write_text(
                             json.dumps({"chat_id": _cli_chat_id}), encoding="utf-8"
                         )
+                        turn_counter = 0
+                        turn_archive.clear()
+                        expanded_turns.clear()
                         console.print("[green]对话历史已清空，已开启新会话[/green]")
                         continue
 
@@ -1250,6 +1534,7 @@ async def run_interactive():
                 await _init_task
         with console.status("[bold yellow]正在停止服务...", spinner="dots"):
             await stop_im_channels(graceful=True, drain_timeout=30.0)
+            await _shutdown_interactive_agent(agent_or_master)
         console.print("[green]✓[/green] 服务已停止")
 
 
@@ -2044,7 +2329,9 @@ def serve(
             )
             shutdown_event.set()
 
-        if not _api_fatal:
+        if not _api_fatal and _startup_shutdown_requested(shutdown_event):
+            logger.info("Shutdown/restart requested during startup, skipping IM startup")
+        elif not _api_fatal:
             # 启动 IM 通道（可选）。放在 HTTP API 之后，避免首次安装通道依赖时
             # 桌面端长时间无法访问本地健康检查。
             _heartbeat_phase = "starting_im"
@@ -2624,4 +2911,3 @@ def reset_password(
 
 if __name__ == "__main__":
     app()
-

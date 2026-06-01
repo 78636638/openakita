@@ -551,6 +551,9 @@ class UnifiedStore:
     def get_session_tenant(self, session_id: str) -> tuple[str, str] | None:
         return self.db.get_session_tenant(session_id)
 
+    def delete_session_tenant(self, session_id: str) -> None:
+        self.db.delete_session_tenant(session_id)
+
     def list_known_tenants(self) -> list[tuple[str, str]]:
         return self.db.list_known_tenants()
 

@@ -113,10 +113,15 @@ def normalize_stream_event(event: dict | None) -> dict:
 
     if event_type == StreamEventType.TODO_CREATED.value and isinstance(payload.get("plan"), dict):
         plan = dict(payload["plan"])
+        plan.setdefault("plan_id", plan.get("id", ""))
+        plan.setdefault("restored", bool(payload.get("restored", plan.get("restored", False))))
         plan.setdefault("task_summary", plan.get("taskSummary", ""))
+        plan.setdefault("title", plan.get("task_summary", ""))
         for step in plan.get("steps", []) or []:
             if isinstance(step, dict):
                 step.setdefault("step_id", step.get("id", ""))
+                step.setdefault("content", step.get("description", ""))
+                step.setdefault("label", step.get("content", step.get("description", "")))
         payload["plan"] = plan
 
     if event_type == StreamEventType.TODO_STEP_UPDATED.value:

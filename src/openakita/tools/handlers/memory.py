@@ -18,6 +18,7 @@
 # 详见 docs/policy_v2_research.md §4.21
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -606,6 +607,13 @@ class MemoryHandler:
                 lines.append(scope_note)
             return "\n".join(lines)
         else:
+            guard_notice = ""
+            pop_guard_notice = getattr(self.agent.memory_manager, "pop_memory_guard_notice", None)
+            if callable(pop_guard_notice):
+                with contextlib.suppress(Exception):
+                    guard_notice = str(pop_guard_notice() or "")
+            if guard_notice:
+                return f"⚠️ {guard_notice}"
             return "记忆已存在（语义相似），无需重复记录。"
 
     def _search_memory(self, params: dict) -> str:

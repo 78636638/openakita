@@ -948,6 +948,7 @@ class MessageGateway:
         self._processing_task: asyncio.Task | None = None
         self._running = False
         self._accepting = True  # False = drain 模式，拒绝新消息
+        self._lifecycle_lock = asyncio.Lock()
         self._started_adapters: list[str] = []
         self._failed_adapters: list[str] = []
         self._failed_adapter_reasons: dict[str, str] = {}
@@ -1820,61 +1821,70 @@ class MessageGateway:
 
     async def start(self) -> None:
         """启动网关"""
-        self._running = True
-        self._accepting = True
+        async with self._lifecycle_lock:
+            if self._running:
+                logger.info("MessageGateway already running, skip duplicate start")
+                return
 
-        # 启动所有适配器
-        started = []
-        failed = []
-        failed_reasons: dict[str, str] = {}
-        for name, adapter in self._adapters.items():
-            try:
-                await adapter.start()
-                started.append(name)
-                logger.info(f"Started adapter: {name}")
-            except Exception as e:
-                failed.append(name)
-                reason = str(e)
-                # 若 reason 只是 "缺少依赖: pip install xxx" 之类笼统提示，
-                # 用 channel-deps 安装错误快照补充更具体的根因（超时/版本冲突/网络）
-                install_err = self._resolve_install_error_for_adapter(name)
-                if install_err and ("缺少依赖" in reason or "ImportError" in reason
-                                    or "No module" in reason or not reason):
-                    reason = f"{reason}（原因：{install_err}）" if reason else install_err
-                failed_reasons[name] = reason
-                adapter._running = False
-                logger.error(f"Failed to start adapter {name}: {e}")
+            self._running = True
+            self._accepting = True
 
-        self._started_adapters = started
-        self._failed_adapters = failed
-        self._failed_adapter_reasons = failed_reasons
+            # 启动所有适配器
+            started = []
+            failed = []
+            failed_reasons: dict[str, str] = {}
+            for name, adapter in self._adapters.items():
+                try:
+                    await adapter.start()
+                    started.append(name)
+                    logger.info(f"Started adapter: {name}")
+                except Exception as e:
+                    failed.append(name)
+                    reason = str(e)
+                    # 若 reason 只是 "缺少依赖: pip install xxx" 之类笼统提示，
+                    # 用 channel-deps 安装错误快照补充更具体的根因（超时/版本冲突/网络）
+                    install_err = self._resolve_install_error_for_adapter(name)
+                    if install_err and (
+                        "缺少依赖" in reason
+                        or "ImportError" in reason
+                        or "No module" in reason
+                        or not reason
+                    ):
+                        reason = f"{reason}（原因：{install_err}）" if reason else install_err
+                    failed_reasons[name] = reason
+                    adapter._running = False
+                    logger.error(f"Failed to start adapter {name}: {e}")
 
-        self._apply_persisted_group_policy()
-        self._apply_persisted_owner_allowlist()
+            self._started_adapters = started
+            self._failed_adapters = failed
+            self._failed_adapter_reasons = failed_reasons
 
-        _notify_im_event(
-            "im:channel_status",
-            {
-                "started": started,
-                "failed": failed,
-                "failed_reasons": failed_reasons,
-            },
-        )
+            self._apply_persisted_group_policy()
+            self._apply_persisted_owner_allowlist()
 
-        # 启动消息处理循环
-        self._processing_task = asyncio.create_task(self._process_loop())
-
-        # 启动 per-session 字典清理任务（每 10 分钟清理不活跃的 session 条目）
-        self._session_dict_cleanup_task = asyncio.create_task(self._session_dict_cleanup_loop())
-
-        if failed:
-            logger.info(
-                f"MessageGateway started with {len(started)}/{len(self._adapters)} adapters"
-                f" (failed: {', '.join(failed)})"
+            _notify_im_event(
+                "im:channel_status",
+                {
+                    "started": started,
+                    "failed": failed,
+                    "failed_reasons": failed_reasons,
+                },
             )
-            self._retry_failed_task = asyncio.create_task(self._retry_failed_adapters_loop())
-        else:
-            logger.info(f"MessageGateway started with {len(started)} adapters")
+
+            # 启动消息处理循环
+            self._processing_task = asyncio.create_task(self._process_loop())
+
+            # 启动 per-session 字典清理任务（每 10 分钟清理不活跃的 session 条目）
+            self._session_dict_cleanup_task = asyncio.create_task(self._session_dict_cleanup_loop())
+
+            if failed:
+                logger.info(
+                    f"MessageGateway started with {len(started)}/{len(self._adapters)} adapters"
+                    f" (failed: {', '.join(failed)})"
+                )
+                self._retry_failed_task = asyncio.create_task(self._retry_failed_adapters_loop())
+            else:
+                logger.info(f"MessageGateway started with {len(started)} adapters")
 
     def get_started_adapters(self) -> list[str]:
         """获取启动成功的适配器列表。"""
@@ -2103,53 +2113,57 @@ class MessageGateway:
 
     async def stop(self) -> None:
         """停止网关（立即停止，不等待进行中任务）"""
-        if self._plugin_hooks:
-            try:
-                await self._plugin_hooks.dispatch("on_shutdown", gateway=self)
-            except Exception as e:
-                logger.debug(f"on_shutdown hook error: {e}")
+        async with self._lifecycle_lock:
+            if self._plugin_hooks:
+                try:
+                    await self._plugin_hooks.dispatch("on_shutdown", gateway=self)
+                except Exception as e:
+                    logger.debug(f"on_shutdown hook error: {e}")
 
-        self._running = False
-        self._accepting = False
+            self._running = False
+            self._accepting = False
 
-        # 停止处理循环
-        if self._processing_task:
-            self._processing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._processing_task
-
-        # 停止失败适配器重试任务
-        if self._retry_failed_task and not self._retry_failed_task.done():
-            self._retry_failed_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._retry_failed_task
-
-        # 停止 per-session 字典清理任务
-        cleanup_task = getattr(self, "_session_dict_cleanup_task", None)
-        if cleanup_task:
-            cleanup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await cleanup_task
-
-        # 取消所有活跃的 session tasks
-        for _skey, task in list(self._session_tasks.items()):
-            if not task.done():
-                task.cancel()
-        for _skey, task in list(self._session_tasks.items()):
-            if not task.done():
+            # 停止处理循环
+            if self._processing_task:
+                self._processing_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        self._session_tasks.clear()
+                    await self._processing_task
+                self._processing_task = None
 
-        # 停止所有适配器
-        for name, adapter in self._adapters.items():
-            try:
-                await adapter.stop()
-                logger.info(f"Stopped adapter: {name}")
-            except Exception as e:
-                logger.error(f"Failed to stop adapter {name}: {e}")
+            # 停止失败适配器重试任务
+            if self._retry_failed_task and not self._retry_failed_task.done():
+                self._retry_failed_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._retry_failed_task
+            self._retry_failed_task = None
 
-        logger.info("MessageGateway stopped")
+            # 停止 per-session 字典清理任务
+            cleanup_task = getattr(self, "_session_dict_cleanup_task", None)
+            if cleanup_task:
+                cleanup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cleanup_task
+                self._session_dict_cleanup_task = None
+
+            # 取消所有活跃的 session tasks
+            for _skey, task in list(self._session_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            for _skey, task in list(self._session_tasks.items()):
+                if not task.done():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            self._session_tasks.clear()
+
+            # 停止所有适配器
+            for name, adapter in self._adapters.items():
+                try:
+                    await adapter.stop()
+                    logger.info(f"Stopped adapter: {name}")
+                except Exception as e:
+                    logger.error(f"Failed to stop adapter {name}: {e}")
+
+            logger.info("MessageGateway stopped")
 
     async def _session_dict_cleanup_loop(self) -> None:
         """定期清理 per-session 字典中不活跃的条目，防止内存泄漏。"""
@@ -2287,20 +2301,26 @@ class MessageGateway:
         """
         name = adapter.channel_name
 
-        if name in self._adapters:
-            logger.warning(f"Adapter {name} already registered, replacing")
-            await self._adapters[name].stop()
+        async with self._lifecycle_lock:
+            existing = self._adapters.get(name)
+            if existing is adapter:
+                logger.info(f"Adapter {name} already registered with the same instance, skipping")
+                return
 
-        # 设置消息回调
-        adapter.on_message(self._on_message)
-        adapter.on_failure(self.report_adapter_failure)
+            if existing is not None:
+                logger.warning(f"Adapter {name} already registered, replacing")
+                await existing.stop()
 
-        self._adapters[name] = adapter
-        logger.info(f"Registered adapter: {name}")
+            # 设置消息回调
+            adapter.on_message(self._on_message)
+            adapter.on_failure(self.report_adapter_failure)
 
-        # 如果网关已运行，启动适配器
-        if self._running:
-            await adapter.start()
+            self._adapters[name] = adapter
+            logger.info(f"Registered adapter: {name}")
+
+            # 如果网关已运行，启动适配器
+            if self._running:
+                await adapter.start()
 
     async def unregister_adapter(self, name: str) -> bool:
         """

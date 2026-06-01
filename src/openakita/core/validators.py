@@ -22,6 +22,24 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_DELIVERY_SUCCESS_STATUSES = {"delivered", "skipped", "relayed", "submitted"}
+_DELIVERY_FAILED_STATUSES = {"failed", "error"}
+
+
+def resolve_delivery_state(receipt: dict) -> str:
+    state = str(receipt.get("delivery_state") or "").strip().lower()
+    if state in {"delivered", "local_only", "failed"}:
+        return state
+
+    status = str(receipt.get("status") or "").strip().lower()
+    if status in _DELIVERY_FAILED_STATUSES:
+        return "failed"
+    if str(receipt.get("channel") or "").strip().lower() == "desktop" and status in _DELIVERY_SUCCESS_STATUSES:
+        return "local_only"
+    if status in _DELIVERY_SUCCESS_STATUSES:
+        return "delivered"
+    return "failed"
+
 
 class ValidationResult(StrEnum):
     """验证结果"""
@@ -186,8 +204,6 @@ class PlanValidator(BaseValidator):
 class ArtifactValidator(BaseValidator):
     """交付物完整性验证"""
 
-    _SUCCESS_STATUSES = {"delivered", "skipped", "relayed"}
-
     @property
     def name(self) -> str:
         return "ArtifactValidator"
@@ -200,14 +216,11 @@ class ArtifactValidator(BaseValidator):
                 reason="No deliver_artifacts call",
             )
 
-        delivered = [
-            r for r in context.delivery_receipts if r.get("status") in self._SUCCESS_STATUSES
+        delivered = [r for r in context.delivery_receipts if resolve_delivery_state(r) == "delivered"]
+        local_only = [
+            r for r in context.delivery_receipts if resolve_delivery_state(r) == "local_only"
         ]
-        failed = [
-            r
-            for r in context.delivery_receipts
-            if r.get("status") not in self._SUCCESS_STATUSES
-        ]
+        failed = [r for r in context.delivery_receipts if resolve_delivery_state(r) == "failed"]
 
         if failed:
             return ValidatorOutput(
@@ -223,11 +236,200 @@ class ArtifactValidator(BaseValidator):
                 reason=f"{len(delivered)} artifacts delivered",
             )
 
+        if local_only:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.WARN,
+                reason=f"{len(local_only)} artifacts available locally only",
+            )
+
         return ValidatorOutput(
             name=self.name,
             result=ValidationResult.FAIL,
-            reason="deliver_artifacts called but no successful delivery receipts",
+            reason="deliver_artifacts called but no usable delivery receipts",
         )
+
+
+class CompletionEvidenceValidator(BaseValidator):
+    """校验“已完成/已交付”类回复是否有足够的确定性证据。"""
+    _FILE_PRODUCTION_TOOLS = {
+        "write_file",
+        "edit_file",
+        "move_file",
+        "auto_persist_node_final_answer",
+    }
+    _DELIVERY_TOOLS = {
+        "deliver_artifacts",
+        "org_submit_deliverable",
+        "org_accept_deliverable",
+    }
+    _CHANNEL_MARKERS = (
+        "飞书",
+        "feishu",
+        "telegram",
+        "微信",
+        "wecom",
+        "钉钉",
+        "dingtalk",
+        "qq",
+        "群",
+        "私聊",
+        "消息",
+    )
+    _DELIVERY_REQUEST_MARKERS = (
+        "推送",
+        "发送",
+        "发给",
+        "发到",
+        "交付",
+        "上传",
+        "回复",
+        "二维码",
+        "附件",
+        "图片",
+        "文件",
+        "截图",
+    )
+    _COMPLETION_CLAIM_MARKERS = (
+        "已发送",
+        "已推送",
+        "已发给",
+        "已发到",
+        "已交付",
+        "已上传",
+        "已保存",
+        "已生成",
+        "请查收",
+        "附件如下",
+        "图片如下",
+    )
+
+    @property
+    def name(self) -> str:
+        return "CompletionEvidenceValidator"
+
+    def validate(self, context: ValidationContext) -> ValidatorOutput:
+        from .response_handler import request_expects_artifact
+
+        request_text = str(context.user_request or "").strip()
+        response_text = str(context.assistant_response or "").strip()
+        executed_set = set(context.executed_tools or [])
+
+        successful_tool_names = {
+            str(tr.get("tool_name") or tr.get("name") or "")
+            for tr in context.tool_results
+            if isinstance(tr, dict) and not tr.get("is_error")
+        }
+        delivered_receipts = [
+            receipt
+            for receipt in context.delivery_receipts
+            if resolve_delivery_state(receipt) == "delivered"
+        ]
+        local_only_receipts = [
+            receipt
+            for receipt in context.delivery_receipts
+            if resolve_delivery_state(receipt) == "local_only"
+        ]
+        failed_receipts = [
+            receipt
+            for receipt in context.delivery_receipts
+            if resolve_delivery_state(receipt) == "failed"
+        ]
+
+        has_file_evidence = bool(successful_tool_names & self._FILE_PRODUCTION_TOOLS)
+        expects_artifact = request_expects_artifact(
+            request_text,
+            has_produced_files=bool(delivered_receipts or local_only_receipts) or has_file_evidence,
+        )
+        is_external_delivery = self._looks_like_external_delivery_request(request_text)
+        makes_completion_claim = self._looks_like_completion_claim(response_text)
+
+        if not (
+            is_external_delivery
+            or expects_artifact
+            or bool(executed_set & self._DELIVERY_TOOLS)
+            or makes_completion_claim
+        ):
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.SKIP,
+                reason="No artifact/external-delivery verification needed",
+            )
+
+        if failed_receipts and (is_external_delivery or expects_artifact or executed_set):
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.FAIL,
+                reason=f"{len(failed_receipts)} delivery receipt(s) failed",
+            )
+
+        if delivered_receipts:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.PASS,
+                reason=f"{len(delivered_receipts)} delivered receipt(s)",
+            )
+
+        if local_only_receipts and is_external_delivery:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.FAIL,
+                reason="Artifact is available locally only; external delivery is not verified",
+            )
+        if local_only_receipts and (expects_artifact or makes_completion_claim):
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.PASS,
+                reason=f"{len(local_only_receipts)} local-only artifact receipt(s)",
+            )
+
+        if expects_artifact and has_file_evidence:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.PASS,
+                reason="Artifact-producing tools completed successfully",
+            )
+
+        if is_external_delivery and "deliver_artifacts" in executed_set:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.FAIL,
+                reason="External delivery attempted without successful delivery receipt",
+            )
+
+        if makes_completion_claim and is_external_delivery:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.FAIL,
+                reason="External delivery claimed without successful delivery evidence",
+            )
+
+        if makes_completion_claim and expects_artifact and not has_file_evidence:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.FAIL,
+                reason="Artifact completion claimed without produced file or delivery receipt",
+            )
+
+        return ValidatorOutput(
+            name=self.name,
+            result=ValidationResult.SKIP,
+            reason="No deterministic completion-evidence conclusion",
+        )
+
+    def _looks_like_external_delivery_request(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        return any(marker in normalized for marker in self._CHANNEL_MARKERS) and any(
+            marker in normalized for marker in self._DELIVERY_REQUEST_MARKERS
+        )
+
+    def _looks_like_completion_claim(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        return any(marker in normalized for marker in self._COMPLETION_CLAIM_MARKERS)
 
 
 class ToolSuccessValidator(BaseValidator):
@@ -459,6 +661,7 @@ class OrgDelegationValidator(BaseValidator):
 _DEFAULT_VALIDATORS: list[BaseValidator] = [
     PlanValidator(),
     ArtifactValidator(),
+    CompletionEvidenceValidator(),
     ToolSuccessValidator(),
     FileValidator(),
     CompletePlanValidator(),
@@ -525,4 +728,3 @@ class ValidatorRegistry:
 def create_default_registry() -> ValidatorRegistry:
     """创建默认验证器注册表"""
     return ValidatorRegistry()
-

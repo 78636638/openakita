@@ -34,6 +34,7 @@ __all__ = [
     # Public API
     "require_todo_for_session",
     "is_todo_required",
+    "is_restorable_todo_plan",
     "has_active_todo",
     "get_active_plan_id",
     "register_active_todo",
@@ -80,6 +81,25 @@ _session_active_todos: dict[str, str] = {}
 
 # 存储 session -> PlanHandler 实例的映射（用于任务完成判断时查询 Plan 状态）
 _session_handlers: dict[str, "PlanHandler"] = {}
+
+_TERMINAL_TODO_STEP_STATUSES = {"completed", "failed", "skipped", "cancelled"}
+
+
+def is_restorable_todo_plan(plan: dict | None) -> bool:
+    """Return True only when a plan still has unfinished work worth restoring."""
+    if not isinstance(plan, dict):
+        return False
+    if str(plan.get("status", "") or "") != "in_progress":
+        return False
+
+    steps = [step for step in (plan.get("steps", []) or []) if isinstance(step, dict)]
+    if not steps:
+        return False
+
+    return any(
+        str(step.get("status", "pending") or "pending") not in _TERMINAL_TODO_STEP_STATUSES
+        for step in steps
+    )
 
 
 def _prune_oldest_sessions() -> None:

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ModelCapabilities:
     """模型能力描述"""
 
-    context_window: int = 200_000
+    context_window: int = 204_800
     max_output_tokens: int = 16_384
     default_output_tokens: int = 4_096
     supports_thinking: bool = False

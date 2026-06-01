@@ -313,13 +313,33 @@ class LearningStore:
             row = conn.execute(query, tuple(params)).fetchone()
         return int(row["c"]) if row else 0
 
-    def list_cases(self, *, limit: int = 100) -> list[LearningCase]:
+    def list_cases(
+        self,
+        *,
+        limit: int = 100,
+        source: str | None = None,
+    ) -> list[LearningCase]:
+        query = "SELECT * FROM learning_cases"
+        params: list[Any] = []
+        if source:
+            query += " WHERE source = ?"
+            params.append(source)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM learning_cases ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_case(row) for row in rows]
+
+    def get_latest_case(self, *, source: str | None = None) -> LearningCase | None:
+        query = "SELECT * FROM learning_cases"
+        params: list[Any] = []
+        if source:
+            query += " WHERE source = ?"
+            params.append(source)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+        return self._row_to_case(row) if row else None
 
     def list_cases_for_planning(self, *, limit: int = 100) -> list[LearningCase]:
         with self._connect() as conn:
@@ -328,6 +348,7 @@ class LearningStore:
                 SELECT * FROM learning_cases
                 WHERE reviewed_at IS NOT NULL
                   AND candidate_actions_json = '[]'
+                  AND source != 'orchestration_result'
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
@@ -347,6 +368,79 @@ class LearningStore:
                 (limit,),
             ).fetchall()
         return [self._row_to_case(row) for row in rows]
+
+    def list_reviewed_cases_with_candidate_actions(self, *, limit: int = 100) -> list[LearningCase]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM learning_cases
+                WHERE candidate_actions_json != '[]'
+                  AND reviewed_at IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_case(row) for row in rows]
+
+    def list_candidate_experience_pool(self, *, limit: int = 100) -> list[LearningCase]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c1.*
+                FROM learning_cases c1
+                WHERE c1.status = 'skipped'
+                  AND c1.case_type = 'success'
+                  AND c1.review_note LIKE 'candidate_experience_pool%'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM learning_cases c2
+                    WHERE c2.status = 'written'
+                      AND c2.problem_summary = c1.problem_summary
+                      AND c2.domain = c1.domain
+                  )
+                ORDER BY c1.reviewed_at DESC, c1.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_case(row) for row in rows]
+
+    def record_candidate_action_hits(
+        self,
+        usages: list[dict[str, Any]],
+        *,
+        query: str = "",
+        source: str = "",
+    ) -> int:
+        normalized = [
+            item
+            for item in (usages or [])
+            if isinstance(item, dict) and str(item.get("target_id", "") or "").strip()
+        ]
+        if not normalized:
+            return 0
+
+        recorded = 0
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            for item in normalized:
+                target_id = str(item.get("target_id", "") or "").strip()
+                if not target_id:
+                    continue
+                self._upsert_hit_stat(
+                    conn,
+                    target_type="candidate_action",
+                    target_id=target_id,
+                    related_case_id=str(item.get("case_id", "") or ""),
+                    memory_id="",
+                    query=query,
+                    source=source,
+                    now=now,
+                )
+                recorded += 1
+            conn.commit()
+        return recorded
 
     def get_case_by_source_ref(self, source_ref: str) -> LearningCase | None:
         with self._connect() as conn:
@@ -759,6 +853,23 @@ class LearningStore:
             ).fetchone()
         return self._row_to_credit_stat(row) if row else None
 
+    def list_credit_stats(
+        self,
+        *,
+        target_type: str | None = None,
+        limit: int = 100,
+    ) -> list[LearningCreditStat]:
+        query = "SELECT * FROM learning_credit_stats"
+        params: list[Any] = []
+        if target_type:
+            query += " WHERE target_type = ?"
+            params.append(target_type)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_credit_stat(row) for row in rows]
+
     def summarize_credit_stats(
         self,
         *,
@@ -925,6 +1036,10 @@ class LearningStore:
                 "tags": json.loads(row["tags_json"] or "[]"),
                 "candidate_actions": json.loads(row["candidate_actions_json"] or "[]"),
                 "lineage": json.loads(row["lineage_json"] or "{}"),
+                "status": row["status"],
+                "review_note": row["review_note"],
+                "reviewed_at": row["reviewed_at"],
+                "memory_ids": json.loads(row["memory_ids_json"] or "[]"),
                 "created_at": row["created_at"],
             }
         )

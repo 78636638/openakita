@@ -270,8 +270,8 @@ class BrowserHandler:
             logger.error(f"Browser tool error: {e}")
 
             if "closed" in error_str.lower() or "target" in error_str.lower():
-                logger.warning("[Browser] Browser/page closed detected, resetting state")
-                await manager.reset_state()
+                logger.warning("[Browser] Browser/page closed detected, cleaning up state")
+                await manager.cleanup_disconnected_state()
                 self.agent._browser_user_closed = True
                 return {
                     "success": False,
@@ -384,8 +384,8 @@ class BrowserHandler:
                         "result": result_data,
                     }
             except Exception as e:
-                logger.warning(f"[Browser] Browser connection lost: {e}, resetting state")
-                await manager.reset_state()
+                logger.warning(f"[Browser] Browser connection lost: {e}, cleaning up state")
+                await manager.cleanup_disconnected_state()
                 self.agent._browser_user_closed = True
                 if visible and not params.get("user_confirmed"):
                     return {

@@ -29,6 +29,8 @@ class TaskExecutor:
     将定时任务转换为 Agent 调用
     """
 
+    _recent_system_successes: dict[str, float] = {}
+
     def __init__(
         self,
         agent_factory: Callable[[], Any] | None = None,
@@ -1086,12 +1088,42 @@ class TaskExecutor:
         try:
             from ..config import settings
             from ..learning.scheduler_hooks import run_learning_ingest
+            from ..learning.store import LearningStore
+            from .locks import get_current_scheduled_task_id
 
             if not settings.learning_loop_enabled or not settings.learning_ingest_enabled:
                 return True, "learning ingest disabled"
 
+            scheduled_task_id = get_current_scheduled_task_id()
+            now = time.monotonic()
+            if scheduled_task_id:
+                last_success = self._recent_system_successes.get(scheduled_task_id, 0.0)
+                if last_success and (now - last_success) < 30:
+                    remaining = max(0, int(30 - (now - last_success)))
+                    summary = (
+                        "学习摄取跳过: 检测到短窗口重复调度 "
+                        f"(task_id={scheduled_task_id}, remaining={remaining}s)"
+                    )
+                    logger.warning(summary)
+                    return True, summary
+
             scanned, inserted = run_learning_ingest()
-            summary = f"学习摄取完成: 扫描 {scanned} 个分析文件，新增 {inserted} 个 LearningCase"
+            if scheduled_task_id:
+                self._recent_system_successes[scheduled_task_id] = now
+            latest_run = LearningStore().get_latest_run("system:hourly_learning_ingest")
+            latest_summary = dict(latest_run.summary) if latest_run else {}
+            scanned_orchestration_records = int(
+                latest_summary.get("scanned_orchestration_records", 0) or 0
+            )
+            inserted_orchestration_cases = int(
+                latest_summary.get("inserted_orchestration_cases", 0) or 0
+            )
+            summary = (
+                "学习摄取完成: "
+                f"扫描 {scanned} 个分析文件/记录，新增 {inserted} 个 LearningCase，"
+                f"编排记录 {scanned_orchestration_records} 条，新增编排案例 "
+                f"{inserted_orchestration_cases} 条"
+            )
             logger.info(summary)
             return True, summary
         except Exception as e:
@@ -1129,12 +1161,25 @@ class TaskExecutor:
         try:
             from ..config import settings
             from ..learning.scheduler_hooks import run_learning_review
+            from ..learning.store import LearningStore
 
             if not settings.learning_loop_enabled or not settings.learning_ingest_enabled:
                 return True, "learning review disabled"
 
             reviewed, written = run_learning_review(self.memory_manager)
-            summary = f"学习回顾完成: 回顾 {reviewed} 个 LearningCase，写入 {written} 条长期记忆"
+            latest_run = LearningStore().get_latest_run("system:daily_learning_review")
+            latest_summary = dict(latest_run.summary) if latest_run else {}
+            candidate_pool_count = int(latest_summary.get("candidate_experience_pool_count", 0) or 0)
+            cases_with_hits = int(latest_summary.get("cases_with_hits", 0) or 0)
+            panel = dict(latest_summary.get("successful_candidate_action_panel", {}) or {})
+            action_count = int(panel.get("action_count", 0) or 0)
+            current_run_helpful = int(panel.get("current_run_helpful_outcomes", 0) or 0)
+            summary = (
+                "学习回顾完成: "
+                f"回顾 {reviewed} 个 LearningCase，写入 {written} 条长期记忆，"
+                f"候选经验池 {candidate_pool_count} 条，命中案例 {cases_with_hits} 条，"
+                f"成功补救动作 {action_count} 个，本轮 helpful {current_run_helpful} 次"
+            )
             logger.info(summary)
             return True, summary
         except Exception as e:

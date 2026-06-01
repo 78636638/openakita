@@ -20,6 +20,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.output import create_output
 
 
 class SlashCommandCompleter(Completer):
@@ -76,6 +77,9 @@ def create_cli_session(
 
     completer = SlashCommandCompleter(commands)
     kb = _build_key_bindings()
+    output = create_output()
+    if hasattr(output, "enable_cpr"):
+        output.enable_cpr = False
 
     session: PromptSession[str] = PromptSession(
         history=FileHistory(str(history_path)),
@@ -85,6 +89,7 @@ def create_cli_session(
         enable_history_search=True,
         mouse_support=False,
         multiline=False,
+        output=output,
     )
 
     return session, completer

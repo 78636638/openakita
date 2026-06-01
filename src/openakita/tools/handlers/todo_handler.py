@@ -22,7 +22,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...core.policy_v2 import ApprovalClass
+from .todo_review import (
+    FAIL_MARKERS,
+    PASS_MARKERS,
+    build_next_round_todo,
+    is_review_step,
+    parse_review_result,
+    summarize_review_summary,
+)
 from .todo_state import (
+    _emit_todo_lifecycle_event,
     _session_handlers,
     force_close_plan,
     has_active_todo,
@@ -91,6 +100,321 @@ class PlanHandler:
             or ""
         )
 
+    @staticmethod
+    def _step_id_aliases(step_id: str) -> tuple[str, ...]:
+        raw = str(step_id or "").strip()
+        if not raw:
+            return ()
+        aliases = [raw]
+        if raw.isdigit():
+            aliases.append(f"step_{raw}")
+        elif raw.startswith("step_"):
+            suffix = raw[5:]
+            if suffix.isdigit():
+                aliases.append(suffix)
+        return tuple(dict.fromkeys(aliases))
+
+    @classmethod
+    def _build_step_lookup(cls, steps: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        lookup: dict[str, dict[str, Any]] = {}
+        for step in steps:
+            sid = str(step.get("id", "") or "").strip()
+            if not sid:
+                continue
+            for alias in cls._step_id_aliases(sid):
+                lookup.setdefault(alias, step)
+        return lookup
+
+    @staticmethod
+    def _is_review_step(step: dict[str, Any]) -> bool:
+        return is_review_step(step)
+
+    @staticmethod
+    def _review_pass_markers() -> tuple[str, ...]:
+        return PASS_MARKERS
+
+    @staticmethod
+    def _review_fail_markers() -> tuple[str, ...]:
+        return FAIL_MARKERS
+
+    @classmethod
+    def _parse_review_summary(cls, step: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(step, dict):
+            return {}
+        summary = parse_review_result(
+            str(step.get("result", "") or ""),
+            requires_code_test=bool(step.get("review_requires_code_test"))
+            or cls._plan_requires_code_review(plan),
+            requires_delivery=cls._plan_requires_delivery_review(plan),
+        )
+        step["review_summary"] = dict(summary)
+        return summary
+
+    @classmethod
+    def _is_code_related_text(cls, text: str) -> bool:
+        normalized = str(text or "").lower()
+        if not normalized:
+            return False
+        keywords = (
+            "代码",
+            "开发",
+            "实现",
+            "修复",
+            "bug",
+            "功能",
+            "接口",
+            "api",
+            "测试",
+            "pytest",
+            "ruff",
+            "mypy",
+            "python",
+            "typescript",
+            "javascript",
+            "rust",
+            "java",
+            "go",
+            "前端",
+            "后端",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    @classmethod
+    def _plan_requires_code_review(cls, plan: dict[str, Any]) -> bool:
+        texts = [str(plan.get("task_summary", "") or "")]
+        for step in plan.get("steps", []) or []:
+            if not isinstance(step, dict):
+                continue
+            description = ""
+            if not cls._is_review_step(step):
+                description = str(step.get("description", "") or "")
+            texts.extend([
+                description,
+                str(step.get("tool", "") or ""),
+                " ".join(str(skill) for skill in (step.get("skills", []) or [])),
+            ])
+        return any(cls._is_code_related_text(text) for text in texts)
+
+    @classmethod
+    def _plan_requires_delivery_review(cls, plan: dict[str, Any]) -> bool:
+        texts = [str(plan.get("task_summary", "") or "")]
+        for step in plan.get("steps", []) or []:
+            if not isinstance(step, dict):
+                continue
+            if cls._is_review_step(step):
+                continue
+            texts.extend([
+                str(step.get("description", "") or ""),
+                str(step.get("tool", "") or ""),
+                " ".join(str(skill) for skill in (step.get("skills", []) or [])),
+            ])
+        keywords = ("推送", "发送", "交付", "上传", "附件", "图片", "文件", "二维码", "飞书")
+        return any(keyword in text for text in texts for keyword in keywords)
+
+    @staticmethod
+    def _build_review_description(requires_code_review: bool) -> str:
+        base = (
+            "审查：默认质疑前序任务均未真正完成，逐项核验完成状态、交付物、是否满足用户需求，"
+            "并检查是否存在幻觉、欺骗或说谎式完成。"
+        )
+        if requires_code_review:
+            return base + "本任务涉及代码时，还必须确认新增代码已完成专业功能测试并达到交付要求。"
+        return base + "若发现问题，必须明确未通过项并进入下一轮 Todo 继续补齐。"
+
+    @classmethod
+    def _build_review_step(
+        cls,
+        steps: list[dict[str, Any]],
+        *,
+        plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        depends_on = [
+            str(step.get("id", "") or "").strip()
+            for step in steps
+            if isinstance(step, dict) and not cls._is_review_step(step)
+        ]
+        requires_code_review = cls._plan_requires_code_review({
+            "task_summary": (plan or {}).get("task_summary", ""),
+            "steps": steps,
+        })
+        step_id = f"step_{len(steps) + 1}"
+        return {
+            "id": step_id,
+            "description": cls._build_review_description(requires_code_review),
+            "depends_on": depends_on,
+            "status": "pending",
+            "result": "",
+            "started_at": None,
+            "completed_at": None,
+            "skills": [],
+            "kind": "review",
+            "review_required": True,
+            "review_requires_code_test": requires_code_review,
+        }
+
+    @classmethod
+    def _ensure_review_step(cls, plan: dict[str, Any]) -> bool:
+        if not isinstance(plan, dict):
+            return False
+        steps = [step for step in (plan.get("steps", []) or []) if isinstance(step, dict)]
+        if any(cls._is_review_step(step) for step in steps):
+            return False
+        review_step = cls._build_review_step(steps, plan=plan)
+        plan["steps"] = steps + [review_step]
+        return True
+
+    @classmethod
+    def _review_step_passed(cls, step: dict[str, Any]) -> bool:
+        summary = step.get("review_summary")
+        if not isinstance(summary, dict):
+            return False
+        if summary.get("passed") is True:
+            return True
+        result = str(summary.get("raw_result", "") or "").strip().lower()
+        if not result:
+            return False
+        if any(marker.lower() in result for marker in cls._review_fail_markers()):
+            return False
+        return any(marker.lower() in result for marker in cls._review_pass_markers())
+
+    @staticmethod
+    def _step_has_meaningful_result(step: dict[str, Any]) -> bool:
+        result = str(step.get("result", "") or "").strip()
+        if not result:
+            return False
+        meaningless = {
+            "pending",
+            "in_progress",
+            "completed",
+            "failed",
+            "skipped",
+            "cancelled",
+            "（无输出）",
+            "(无输出)",
+        }
+        return result.lower() not in meaningless and len(result) >= 4
+
+    @staticmethod
+    def _has_test_evidence(plan: dict[str, Any]) -> bool:
+        strong_keywords = (
+            "pytest",
+            "单元测试",
+            "集成测试",
+            "功能测试",
+            "回归测试",
+            "e2e",
+            "diagnostic",
+            "diagnostics",
+            "ruff",
+            "mypy",
+            "getdiagnostics",
+        )
+        action_keywords = ("运行", "执行", "完成", "已跑", "已运行", "已执行", "通过")
+        test_keywords = ("测试", "验证", "诊断")
+        negative_markers = ("没有测试", "未测试", "未记录测试", "缺少测试", "没有写测试")
+        for step in plan.get("steps", []) or []:
+            if not isinstance(step, dict):
+                continue
+            description = ""
+            if not PlanHandler._is_review_step(step):
+                description = str(step.get("description", "") or "")
+            combined = " ".join(
+                [
+                    description,
+                    str(step.get("result", "") or ""),
+                    str(step.get("tool", "") or ""),
+                    " ".join(str(skill) for skill in (step.get("skills", []) or [])),
+                ]
+            ).lower()
+            if any(keyword in combined for keyword in strong_keywords):
+                return True
+            if any(marker in combined for marker in negative_markers):
+                continue
+            if any(keyword in combined for keyword in action_keywords) and any(
+                keyword in combined for keyword in test_keywords
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _review_has_verified_test_evidence(
+        cls,
+        review_summary: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> bool:
+        test_evidence = review_summary.get("test_evidence")
+        if not isinstance(test_evidence, dict):
+            return False
+        if test_evidence.get("verified") is not True:
+            return False
+        evidence_step_ids = [
+            str(item).strip()
+            for item in (test_evidence.get("evidence_step_ids") or [])
+            if str(item).strip()
+        ]
+        if not evidence_step_ids:
+            return cls._has_test_evidence(plan)
+        completed_ids = {
+            str(step.get("id", "")).strip()
+            for step in (plan.get("steps", []) or [])
+            if isinstance(step, dict)
+            and not cls._is_review_step(step)
+            and str(step.get("status", "") or "").strip() == "completed"
+        }
+        return all(step_id in completed_ids for step_id in evidence_step_ids)
+
+    @classmethod
+    def _collect_completion_blockers(cls, plan: dict[str, Any]) -> list[str]:
+        steps = [step for step in (plan.get("steps", []) or []) if isinstance(step, dict)]
+        blockers: list[str] = []
+        review_steps = [step for step in steps if cls._is_review_step(step)]
+        normal_steps = [step for step in steps if not cls._is_review_step(step)]
+        review_summary: dict[str, Any] = {}
+
+        if not review_steps:
+            blockers.append("缺少最终“审查”步骤")
+        else:
+            review_step = review_steps[-1]
+            review_summary = cls._parse_review_summary(review_step, plan)
+            plan["review_summary"] = dict(review_summary)
+            review_status = str(review_step.get("status", "") or "").strip()
+            if review_status != "completed":
+                blockers.append("最终“审查”步骤尚未完成")
+            elif not cls._review_step_passed(review_step):
+                blockers.append("最终“审查”未明确通过")
+            if not cls._step_has_meaningful_result(review_step):
+                blockers.append("最终“审查”缺少可核验结论")
+            blockers.extend(
+                str(item).strip()
+                for item in (review_summary.get("blockers") or [])
+                if str(item).strip()
+            )
+            if cls._plan_requires_delivery_review(plan) and review_summary.get("delivery_verified") is False:
+                blockers.append("交付回执或交付物未核验通过")
+            missing_deliverables = review_summary.get("missing_deliverables") or []
+            blockers.extend(
+                f"缺少交付物：{item}"
+                for item in missing_deliverables
+                if str(item or "").strip()
+            )
+
+        for step in normal_steps:
+            step_id = str(step.get("id", "") or "?").strip()
+            status = str(step.get("status", "") or "pending").strip()
+            if status in {"pending", "in_progress"}:
+                blockers.append(f"步骤 {step_id} 尚未结束")
+            elif status in {"failed", "skipped", "cancelled"}:
+                blockers.append(f"步骤 {step_id} 状态为 {status}")
+            elif status == "completed" and not cls._step_has_meaningful_result(step):
+                blockers.append(f"步骤 {step_id} 缺少可核验结果")
+
+        if cls._plan_requires_code_review(plan) and not (
+            cls._review_has_verified_test_evidence(review_summary, plan) or cls._has_test_evidence(plan)
+        ):
+            blockers.append("代码任务缺少测试或诊断证据")
+
+        return list(dict.fromkeys(blockers))
+
     def _get_current_todo(self) -> dict | None:
         """获取当前会话的 Todo（会话隔离）。
 
@@ -116,9 +440,12 @@ class PlanHandler:
             # Fallback: recover from persistent store
             stored = self._store.get(cid)
             if stored is not None and stored.get("status") == "in_progress":
+                mutated = self._ensure_review_step(stored)
                 self._todos_by_session[cid] = stored
                 register_plan_handler(cid, self)
                 register_active_todo(cid, stored.get("id", ""))
+                if mutated:
+                    self._store.upsert(cid, stored)
                 logger.info(f"[Todo] Recovered todo {stored.get('id')} from TodoStore for {cid}")
                 return stored
             return None
@@ -144,9 +471,12 @@ class PlanHandler:
                 return plan
             stored = self._store.get(conversation_id)
             if stored is not None and stored.get("status") == "in_progress":
+                mutated = self._ensure_review_step(stored)
                 self._todos_by_session[conversation_id] = stored
                 register_plan_handler(conversation_id, self)
                 register_active_todo(conversation_id, stored.get("id", ""))
+                if mutated:
+                    self._store.upsert(conversation_id, stored)
                 return stored
             return None
         return self.current_todo
@@ -194,6 +524,28 @@ class PlanHandler:
             self.current_todo = None
         self._store.remove(session_id)
 
+    def _close_superseded_active_plan(
+        self,
+        plan: dict,
+        *,
+        conversation_id: str,
+        next_plan_id: str,
+    ) -> None:
+        """Close a stale active plan before a new top-level todo takes over."""
+        old_plan_id = str(plan.get("id", "") or "").strip()
+        plan["summary"] = (
+            f"新计划 {next_plan_id} 已创建，旧计划 {old_plan_id or 'unknown'} 自动结束。"
+        )
+        self.finalize_plan(plan, conversation_id, action="cancel")
+        unregister_active_todo(conversation_id)
+        _emit_todo_lifecycle_event(conversation_id, "todo_cancelled", plan)
+        logger.info(
+            "[Plan] Superseded stale active plan %s with new plan %s for %s",
+            old_plan_id or "?",
+            next_plan_id,
+            conversation_id,
+        )
+
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
         """处理工具调用"""
         if tool_name == "create_todo":
@@ -216,22 +568,18 @@ class PlanHandler:
         if "task_summary" not in params and "goal" in params:
             params["task_summary"] = params.pop("goal")
 
+        plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
         _plan = self._get_current_todo()
-        if _plan and _plan.get("status") == "in_progress":
-            existing_plan_id = _plan["id"]
-            logger.info(
-                f"[Plan] Creating new plan while existing plan {existing_plan_id} "
-                f"is still in progress (multi-plan mode)"
-            )
-
         cid = self._get_conversation_id()
+        if _plan and _plan.get("status") == "in_progress" and cid:
+            self._close_superseded_active_plan(_plan, conversation_id=cid, next_plan_id=plan_id)
+            _plan = None
+
         if cid and has_active_todo(cid) and _plan is None:
             logger.warning(
                 f"[Plan] Inconsistent state: active_todo registered but no plan data for {cid}, force-closing"
             )
             force_close_plan(cid)
-
-        plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
 
         steps = params.get("steps", [])
         if isinstance(steps, str):
@@ -282,6 +630,12 @@ class PlanHandler:
             normalized_steps.append(step)
 
         steps = normalized_steps
+        temp_plan = {
+            "task_summary": params.get("task_summary", ""),
+            "steps": steps,
+        }
+        self._ensure_review_step(temp_plan)
+        steps = temp_plan["steps"]
 
         _new_plan = {
             "id": plan_id,
@@ -364,50 +718,55 @@ class PlanHandler:
             "cancelled": set(),
         }
 
-        step_found = False
-        for step in _plan["steps"]:
-            if step["id"] == step_id:
-                old_status = step.get("status", "pending")
-                allowed = _VALID_TRANSITIONS.get(old_status, set())
-                if status != old_status and status not in allowed:
-                    return (
-                        f"⚠️ 步骤 {step_id} 当前状态为 {old_status}，"
-                        f"不允许直接变更为 {status}。"
-                        f"允许的目标状态：{', '.join(sorted(allowed)) or '无（已终态）'}"
-                    )
-                if status == "in_progress":
-                    deps = step.get("depends_on", [])
-                    if deps:
-                        _DONE = {"completed", "skipped", "cancelled"}
-                        steps_map = {s["id"]: s for s in _plan["steps"]}
-                        blocked = [
-                            d for d in deps if steps_map.get(d, {}).get("status") not in _DONE
-                        ]
-                        if blocked:
-                            return (
-                                f"⚠️ 步骤 {step_id} 依赖于 {', '.join(blocked)}，"
-                                f"这些步骤尚未完成，请先完成它们。"
-                            )
-                step["status"] = status
-                step["result"] = result
-                step.setdefault("skills", [])
-                step["skills"] = self._ensure_step_skills(step)
-
-                if status == "in_progress" and not step.get("started_at"):
-                    step["started_at"] = datetime.now().isoformat()
-                if status == "in_progress":
-                    step["_last_updated_turn"] = _plan.get("_current_turn_id", "")
-                elif status in ["completed", "failed", "skipped", "cancelled"]:
-                    step["completed_at"] = datetime.now().isoformat()
-
-                step_found = True
-                logger.info(
-                    f"[Plan] Step update {step_id} status={status} tool={step.get('tool', '-')} skills={step.get('skills', [])}"
-                )
-                break
-
-        if not step_found:
+        steps = _plan["steps"]
+        steps_map = self._build_step_lookup(steps)
+        step = steps_map.get(step_id)
+        if step is None:
             return f"❌ 未找到步骤：{step_id}"
+
+        resolved_step_id = str(step.get("id", "") or step_id)
+        old_status = step.get("status", "pending")
+        allowed = _VALID_TRANSITIONS.get(old_status, set())
+        if status != old_status and status not in allowed:
+            return (
+                f"⚠️ 步骤 {resolved_step_id} 当前状态为 {old_status}，"
+                f"不允许直接变更为 {status}。"
+                f"允许的目标状态：{', '.join(sorted(allowed)) or '无（已终态）'}"
+            )
+        if status == "in_progress":
+            deps = step.get("depends_on", [])
+            if deps:
+                _DONE = {"completed", "skipped", "cancelled"}
+                if self._is_review_step(step):
+                    _DONE = _DONE | {"failed"}
+                blocked = [d for d in deps if steps_map.get(d, {}).get("status") not in _DONE]
+                if blocked:
+                    return (
+                        f"⚠️ 步骤 {resolved_step_id} 依赖于 {', '.join(blocked)}，"
+                        f"这些步骤尚未完成，请先完成它们。"
+                    )
+        step["status"] = status
+        step["result"] = result
+        step.setdefault("skills", [])
+        step["skills"] = self._ensure_step_skills(step)
+        if self._is_review_step(step) and status in ["completed", "failed", "skipped", "cancelled"]:
+            step["review_summary"] = self._parse_review_summary(step, _plan)
+
+        if status == "in_progress" and not step.get("started_at"):
+            step["started_at"] = datetime.now().isoformat()
+        if status == "in_progress":
+            step["_last_updated_turn"] = _plan.get("_current_turn_id", "")
+        elif status in ["completed", "failed", "skipped", "cancelled"]:
+            step["completed_at"] = datetime.now().isoformat()
+
+        logger.info(
+            "[Plan] Step update %s (requested=%s) status=%s tool=%s skills=%s",
+            resolved_step_id,
+            step_id,
+            status,
+            step.get("tool", "-"),
+            step.get("skills", []),
+        )
 
         self._save_plan_markdown()
         cid_for_store = self._get_conversation_id()
@@ -418,23 +777,18 @@ class PlanHandler:
             status, "📌"
         )
 
-        self._add_log(f"{status_emoji} {step_id}: {result or status}")
+        self._add_log(f"{status_emoji} {resolved_step_id}: {result or status}")
 
-        steps = _plan["steps"]
         total_count = len(steps)
 
         step_number = next(
-            (i + 1 for i, s in enumerate(steps) if s["id"] == step_id),
+            (i + 1 for i, s in enumerate(steps) if s is step),
             0,
         )
 
-        step_desc = ""
-        for s in steps:
-            if s["id"] == step_id:
-                step_desc = s.get("description", "")
-                break
+        step_desc = str(step.get("description", "") or "")
 
-        message = f"{status_emoji} **[{step_number}/{total_count}]** {step_desc or step_id}"
+        message = f"{status_emoji} **[{step_number}/{total_count}]** {step_desc or resolved_step_id}"
         if status == "completed" and result:
             message += f"\n   结果：{result}"
         elif status == "failed":
@@ -452,7 +806,7 @@ class PlanHandler:
         except Exception as e:
             logger.warning(f"Failed to emit step progress: {e}")
 
-        response = f"步骤 {step_id} 状态已更新为 {status}"
+        response = f"步骤 {resolved_step_id} 状态已更新为 {status}"
 
         if status == "completed":
             pending_steps = [s for s in steps if s.get("status") in ("pending", "in_progress")]
@@ -522,17 +876,48 @@ class PlanHandler:
         summary = params.get("summary", "")
 
         steps = _plan["steps"]
-        still_active = [s for s in steps if s.get("status") in ("pending", "in_progress")]
-        if still_active:
-            active_ids = [s.get("id", "?") for s in still_active[:5]]
+        if self._ensure_review_step(_plan):
+            self._save_plan_markdown()
+            conversation_id = self._get_conversation_id()
+            if conversation_id:
+                self._store.upsert(conversation_id, _plan)
+
+        blockers = self._collect_completion_blockers(_plan)
+        if blockers:
+            review_step = next((step for step in reversed(steps) if self._is_review_step(step)), None)
+            review_summary = review_step.get("review_summary", {}) if isinstance(review_step, dict) else {}
+            next_round_todo = build_next_round_todo(
+                _plan,
+                blockers=blockers,
+                review_summary=review_summary if isinstance(review_summary, dict) else {},
+            )
+            _plan["next_round_todo"] = next_round_todo
+            if isinstance(review_summary, dict) and review_summary:
+                _plan["review_summary"] = dict(review_summary)
+            self._add_log(
+                "审查未通过，已生成下一轮 Todo："
+                + ", ".join(step["description"] for step in next_round_todo.get("steps", [])[:3]),
+            )
+            self._save_plan_markdown()
+            conversation_id = self._get_conversation_id()
+            if conversation_id:
+                self._store.upsert(conversation_id, _plan)
+            next_round_lines = [
+                f"- {step.get('id')}: {step.get('description')}"
+                for step in next_round_todo.get("steps", [])[:5]
+            ]
             return (
-                f"⚠️ 还有 {len(still_active)} 个步骤未完成：{', '.join(active_ids)}。\n"
-                "请先完成或跳过这些步骤，再标记计划完成。"
+                "⚠️ 当前计划未通过最终审查，暂不能标记完成。\n- "
+                + "\n- ".join(blockers[:8])
+                + "\n\n建议自动生成的下一轮 Todo：\n"
+                + "\n".join(next_round_lines)
+                + "\n\n请基于上述未通过项立即制定下一轮 Todo，继续补齐后再重新审查。"
             )
 
         _plan["status"] = "completed"
         _plan["completed_at"] = datetime.now().isoformat()
         _plan["summary"] = summary
+        _plan.pop("next_round_todo", None)
 
         completed = sum(1 for s in steps if s["status"] == "completed")
         failed = sum(1 for s in steps if s["status"] == "failed")
@@ -1034,6 +1419,19 @@ completed_at: {plan.get("completed_at") or ""}
 
         if plan.get("summary"):
             content += f"\n## 完成总结\n\n{plan['summary']}\n"
+
+        review_summary = plan.get("review_summary")
+        if isinstance(review_summary, dict) and review_summary:
+            content += "\n## 审查摘要\n\n"
+            content += summarize_review_summary(review_summary) or "无"
+            content += "\n"
+
+        next_round_todo = plan.get("next_round_todo")
+        if isinstance(next_round_todo, dict) and next_round_todo.get("steps"):
+            content += "\n## 下一轮 Todo 建议\n\n"
+            content += f"- task_summary: {next_round_todo.get('task_summary', '')}\n"
+            for step in next_round_todo.get("steps", [])[:10]:
+                content += f"- {step.get('id', '')}: {step.get('description', '')}\n"
 
         plan_file.write_text(content, encoding="utf-8")
         logger.info(f"[Plan] Saved to: {plan_file}")

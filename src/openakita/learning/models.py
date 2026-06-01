@@ -37,6 +37,10 @@ class LearningCase:
     tags: list[str] = field(default_factory=list)
     candidate_actions: list[dict[str, Any]] = field(default_factory=list)
     lineage: dict[str, Any] = field(default_factory=dict)
+    status: str = "new"
+    review_note: str = ""
+    reviewed_at: str | None = None
+    memory_ids: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -62,6 +66,10 @@ class LearningCase:
             "tags": list(self.tags),
             "candidate_actions": list(self.candidate_actions),
             "lineage": dict(self.lineage),
+            "status": self.status,
+            "review_note": self.review_note,
+            "reviewed_at": self.reviewed_at,
+            "memory_ids": list(self.memory_ids),
         }
 
     @classmethod
@@ -89,4 +97,8 @@ class LearningCase:
             tags=list(record.get("tags", []) or []),
             candidate_actions=list(record.get("candidate_actions", []) or []),
             lineage=dict(record.get("lineage", {}) or {}),
+            status=record.get("status", "new"),
+            review_note=record.get("review_note", ""),
+            reviewed_at=record.get("reviewed_at"),
+            memory_ids=list(record.get("memory_ids", []) or []),
         )

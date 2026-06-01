@@ -1795,6 +1795,29 @@ class MemoryStorage:
             logger.debug(f"[MemoryStorage] get_session_tenant failed: {e}")
             return None
 
+    def delete_session_tenant(self, session_id: str) -> None:
+        """Delete a session→tenant mapping when the runtime determines the
+        session is running under an unsafe fallback identity.
+
+        This keeps ``LifecycleManager._resolve_tenant_for_session()`` aligned
+        with the online guard: if the session is not safe for long-term writes,
+        background extraction should also treat it as tenant-unknown and route
+        synthesized memories into ``pending_consolidation``.
+        """
+        if not self._conn or not session_id:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM session_tenants WHERE session_id = ?",
+                    (session_id,),
+                )
+                self._conn.commit()
+            except Exception as e:
+                if _is_db_locked(e):
+                    raise
+                logger.warning(f"[MemoryStorage] delete_session_tenant failed: {e}")
+
     def iter_owned_session_ids(
         self,
         *,

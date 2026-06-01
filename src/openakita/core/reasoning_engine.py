@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -33,13 +34,13 @@ from ..api.routes.websocket import broadcast_event
 from ..config import settings
 from ..llm.converters.tools import PARSE_ERROR_KEY
 from ..tracing.tracer import get_tracer
+from .abort_scope import current_abort_scope
 from .agent_state import (
     AgentState,
     IllegalReasoningEntry,
     TaskState,
     TaskStatus,
 )
-from .abort_scope import current_abort_scope
 from .cancel_cleanup import synthesize_tool_results_for_orphans
 from .context_manager import ContextManager
 from .context_manager import _CancelledError as _CtxCancelledError
@@ -883,6 +884,13 @@ _CLAIMED_TOOL_TO_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "delete_file": ("delete_file",),
 }
 
+_ADMIN_SUMMARY_TOOL_NAMES = frozenset({
+    "create_todo",
+    "update_todo_step",
+    "get_todo_status",
+    "complete_todo",
+})
+
 
 # 动词 → 候选工具名片段（小写子串匹配）。
 # 当 LLM 文本里说"已删除/已发送..."时，必须有匹配片段的工具在本轮"成功"
@@ -911,6 +919,8 @@ _VERB_TO_TOOL_FRAGMENTS: dict[str, tuple[str, ...]] = {
         "create_plan_file",
         "create_todo",
         "schedule_task",
+        "browser_screenshot",
+        "desktop_screenshot",
     ),
     "保存到记忆": ("add_memory", "update_user_profile"),
     "记住": ("add_memory", "update_user_profile"),
@@ -930,6 +940,13 @@ _VERB_TO_TOOL_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "卸载": ("uninstall_skill",),
     "读取": ("read_file", "run_shell", "run_powershell"),
 }
+
+_STRUCTURED_RECAP_MARKERS = (
+    "任务执行完成",
+    "执行结果",
+    "任务完成通知",
+    "子任务",
+)
 
 
 def _successful_tool_names(
@@ -957,6 +974,59 @@ def _successful_tool_names(
     # receipt as backing evidence, while tools without result entries keep the
     # historical optimistic behavior.
     return {name for name in executed if name not in seen or name in succeeded}
+
+
+def _looks_like_structured_task_recap(
+    text: str,
+    executed_tool_names: list[str],
+) -> bool:
+    """True when visible text is summarising earlier subtask receipts.
+
+    Typical shape:
+    - current turn executed at least one real tool
+    - visible text contains "子任务"/"任务执行完成"
+    - each subtask block embeds "工具:" / "工具调用:" receipts for earlier steps
+
+    In this case, later recap sentences such as "截图已保存至 ..." should be
+    backed by the earlier structured receipts inside the same response instead
+    of being compared only against the final local tool subset.
+    """
+    if not text or not executed_tool_names:
+        return False
+    if "工具:" not in text and "工具调用:" not in text:
+        return False
+    return any(marker in text for marker in _STRUCTURED_RECAP_MARKERS)
+
+
+def _extract_structured_recap_tool_names(text: str) -> set[str]:
+    """Extract tool names from recap blocks such as ``工具: foo`` / ``工具调用: ...``."""
+    import re as _re
+
+    if not text:
+        return set()
+
+    names: set[str] = set()
+    candidate_chunks = []
+    candidate_chunks.extend(_re.findall(r"工具:\s*([A-Za-z0-9_,\-\s]+)", text))
+    candidate_chunks.extend(_re.findall(r"工具调用:\s*\d+\s*次\s*\(([^)]*)\)", text))
+
+    for chunk in candidate_chunks:
+        for part in _re.split(r"[,，/\s]+", str(chunk or "")):
+            token = part.strip()
+            if _re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", token):
+                names.add(token)
+    return names
+
+
+def _strip_structured_recap_markers_for_claim_check(text: str) -> str:
+    """Remove same-turn summary labels so claim checks can still flag fresh mismatches."""
+    import re as _re
+
+    cleaned = text or ""
+    cleaned = _re.sub(r"页面\s*\d+\s*行总结[:：]?", "", cleaned)
+    cleaned = _re.sub(r"子任务\s*\d+\s*[:：]?", "", cleaned)
+    cleaned = _re.sub(r"(?:任务执行完成|执行结果|任务完成通知)[:：]?", "", cleaned)
+    return cleaned
 
 
 # 历史回溯标记：当声明动词 *附近* 出现这些词，说明 LLM 是在汇总过去动作，
@@ -1062,6 +1132,8 @@ def _guard_unbacked_action_claim(
         return text
 
     successful_tools = _successful_tool_names(executed_tool_names, tool_results)
+    if _looks_like_structured_task_recap(text, executed_tool_names):
+        successful_tools |= _extract_structured_recap_tool_names(text)
 
     if not executed_tool_names:
         # 整段回复是历史汇总（含时间戳/回溯副词且无新动作迹象）→ 守卫不应介入，
@@ -1082,7 +1154,13 @@ def _guard_unbacked_action_claim(
             + memory_hint
         )
 
+    is_structured_recap = _looks_like_structured_task_recap(text, executed_tool_names)
     unbacked = _extract_unbacked_verbs(text, successful_tools)
+    if not unbacked and is_structured_recap:
+        unbacked = _extract_unbacked_verbs(
+            _strip_structured_recap_markers_for_claim_check(text),
+            successful_tools,
+        )
     if not unbacked:
         return text
 
@@ -1096,6 +1174,49 @@ def _guard_unbacked_action_claim(
         "如需重试请明确告知。"
     )
     return text.rstrip() + warning
+
+
+def _looks_like_external_delivery_request(text: str) -> bool:
+    normalized = (text or "").lower()
+    if not normalized:
+        return False
+    channel_markers = (
+        "飞书", "feishu", "telegram", "微信", "wecom", "钉钉", "dingtalk", "qq",
+        "群", "私聊", "消息",
+    )
+    delivery_markers = (
+        "推送", "发送", "发给", "发到", "交付", "上传", "回复",
+        "二维码", "附件", "图片", "文件", "截图",
+    )
+    return any(marker in normalized for marker in channel_markers) and any(
+        marker in normalized for marker in delivery_markers
+    )
+
+
+def _should_force_retry_unbacked_delivery_claim(
+    *,
+    user_request: str,
+    assistant_text: str,
+    max_no_tool_retries: int,
+) -> bool:
+    """Retry instead of accepting text-only completion for delivery tasks.
+
+    Targeted guard: when the user explicitly asked for an IM/file delivery style
+    action, and the assistant answers with a delivery-complete style statement
+    but no tools ran, we should retry into tool execution instead of merely
+    appending a soft disclaimer.
+    """
+    if max_no_tool_retries <= 0:
+        return False
+    if not _looks_like_external_delivery_request(user_request):
+        return False
+
+    text = (assistant_text or "").strip()
+    if not text:
+        return False
+
+    delivery_claim_markers = ("发送", "推送", "发给", "发到", "交付", "上传", "回复")
+    return any(marker in text for marker in delivery_claim_markers)
 
 
 _USER_BLOCKED_MARKERS = (
@@ -4270,12 +4391,17 @@ class ReasoningEngine:
             # --- 恢复的 Todo：补发 SSE 事件让前端重建 FloatingPlanBar ---
             if conversation_id:
                 try:
-                    from ..tools.handlers.plan import get_todo_handler_for_session, has_active_todo
+                    from ..tools.handlers.plan import (
+                        auto_close_todo,
+                        get_todo_handler_for_session,
+                        has_active_todo,
+                        is_restorable_todo_plan,
+                    )
 
                     if has_active_todo(conversation_id):
                         _rh = get_todo_handler_for_session(conversation_id)
                         _rp = _rh.get_plan_for(conversation_id) if _rh else None
-                        if _rp and _rp.get("status") == "in_progress":
+                        if _rp and is_restorable_todo_plan(_rp):
                             yield {
                                 "type": "todo_created",
                                 "restored": True,
@@ -4293,6 +4419,8 @@ class ReasoningEngine:
                                     "status": "in_progress",
                                 },
                             }
+                        elif _rp:
+                            auto_close_todo(conversation_id)
                 except Exception:
                     pass
 
@@ -5043,6 +5171,9 @@ class ReasoningEngine:
                             for i in range(0, len(result), chunk_size):
                                 yield {"type": "text_delta", "content": result[i : i + chunk_size]}
                                 await asyncio.sleep(0.01)
+                        if not is_verify_incomplete and conversation_id:
+                            if self._auto_close_active_todo_after_success(conversation_id):
+                                yield {"type": "todo_completed"}
                         await broadcast_event(
                             "pet-status-update",
                             {"status": "error" if is_verify_incomplete else "success"},
@@ -8032,6 +8163,16 @@ class ReasoningEngine:
                     bypass=supervisor_intervened or is_summary_round,
                     **org_validation_kwargs,
                 )
+                verification_summary = None
+                getter = getattr(self._response_handler, "get_last_task_verification_summary", None)
+                if callable(getter):
+                    try:
+                        verification_summary = getter()
+                        if inspect.isawaitable(verification_summary):
+                            verification_summary = await verification_summary
+                    except Exception:
+                        verification_summary = None
+                self._persist_task_verification_summary(verification_summary)
 
                 if is_completed:
                     # P0-2 阶段 4：工具失败 vs 助手乐观措辞 一致性检测（成功路径 belt）
@@ -8232,6 +8373,7 @@ class ReasoningEngine:
         stripped_text = _guard_unbacked_action_claim(
             stripped_text or "", executed_tool_names, all_tool_results
         )
+        last_user_request = ResponseHandler.get_last_user_request(original_messages) or ""
         logger.info(
             f"[IntentTag] intent={intent or 'NONE'}, "
             f"has_tool_calls=False, tools_executed_in_task=False, "
@@ -8293,6 +8435,48 @@ class ReasoningEngine:
                 "accepting as valid response (no ForceToolCall)"
             )
             return clean_llm_response(stripped_text)
+
+        if _should_force_retry_unbacked_delivery_claim(
+            user_request=last_user_request,
+            assistant_text=(stripped_text or "").strip(),
+            max_no_tool_retries=max_no_tool_retries,
+        ):
+            no_tool_call_count += 1
+            if no_tool_call_count <= max_no_tool_retries:
+                logger.warning(
+                    "[IntentTag] External delivery request returned "
+                    "text-only completion without tool calls — forcing retry "
+                    f"({no_tool_call_count}/{max_no_tool_retries})"
+                )
+                if stripped_text:
+                    working_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": stripped_text}],
+                            "reasoning_content": decision.thinking_content or None,
+                        }
+                    )
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[系统] ⚠️ 用户要求的是实际发送/推送/交付动作，"
+                            "你刚才没有调用任何工具。请先创建或更新 Todo，"
+                            "然后继续调用所需工具真正完成交付；不要只在文字里说已发送。"
+                        ),
+                    }
+                )
+                return (
+                    working_messages,
+                    no_tool_call_count,
+                    verify_incomplete_count,
+                    no_confirmation_text_count,
+                    max_no_tool_retries,
+                )
+            logger.warning(
+                "[IntentTag] External delivery retry budget exhausted, "
+                "falling through to disclaimer path"
+            )
 
         # No intent tag but visible text is a genuine analysis / knowledge /
         # writing response. Accept it as implicit REPLY as long as it does not
@@ -9141,6 +9325,92 @@ class ReasoningEngine:
             logger.debug("[Verify] _build_org_validation_kwargs failed: %s", exc)
             return {}
 
+    def _persist_task_verification_summary(self, summary: dict[str, Any] | None) -> None:
+        if not isinstance(summary, dict) or not summary:
+            return
+
+        session = getattr(self._state, "current_session", None)
+        if session is None:
+            return
+
+        try:
+            session.set_metadata("last_task_verification_summary", dict(summary))
+        except Exception:
+            pass
+
+        try:
+            pending_id = (
+                session.get_metadata("_pending_orchestration_verification_id")
+                if hasattr(session, "get_metadata")
+                else None
+            )
+        except Exception:
+            pending_id = None
+        if not pending_id:
+            return
+
+        context = getattr(session, "context", None)
+        records = getattr(context, "orchestration_records", None) or []
+        if not records:
+            return
+
+        target_record = None
+        for record in reversed(records):
+            if str(record.get("orchestration_id", "") or "") == str(pending_id):
+                target_record = record
+                break
+        if target_record is None:
+            return
+
+        target_record["verification_summary"] = dict(summary)
+
+        try:
+            agent = getattr(self._tool_executor, "_agent_ref", None)
+            if agent is not None and hasattr(agent, "_build_orchestration_work_summary"):
+                target_record["work_summary"] = agent._build_orchestration_work_summary(target_record)
+        except Exception:
+            pass
+
+        try:
+            last_orchestration = (
+                session.get_metadata("last_orchestration_result")
+                if hasattr(session, "get_metadata")
+                else None
+            )
+            if isinstance(last_orchestration, dict) and str(
+                last_orchestration.get("orchestration_id", "") or ""
+            ) == str(pending_id):
+                updated = dict(last_orchestration)
+                updated["verification_summary"] = dict(summary)
+                if target_record.get("work_summary"):
+                    updated["work_summary"] = target_record["work_summary"]
+                session.set_metadata("last_orchestration_result", updated)
+            session.set_metadata("_pending_orchestration_verification_id", None)
+        except Exception:
+            pass
+
+        manager = getattr(session, "_manager", None)
+        if manager is not None:
+            try:
+                if hasattr(manager, "mark_dirty"):
+                    manager.mark_dirty()
+                if hasattr(manager, "persist"):
+                    manager.persist()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _auto_close_active_todo_after_success(conversation_id: str) -> bool:
+        if not str(conversation_id or "").strip():
+            return False
+        try:
+            from ..tools.handlers.plan import auto_close_todo
+
+            return bool(auto_close_todo(conversation_id))
+        except Exception as exc:
+            logger.debug("[Todo] stream success auto_close_todo failed: %s", exc)
+            return False
+
     @staticmethod
     def _is_in_progress_promise(text: str) -> bool:
         """检测响应是否为'进行中承诺'——模型声称正在执行但实际未调用工具。
@@ -9261,4 +9531,3 @@ class ReasoningEngine:
         except Exception:
             pass
         return False
-

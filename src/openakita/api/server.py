@@ -43,6 +43,7 @@ from .routes import (
     hub,
     identity,
     im,
+    learning,
     logs,
     mcp,
     memory,
@@ -412,6 +413,7 @@ def create_app(
     app.include_router(files.router, tags=["文件"])
     app.include_router(health.router, tags=["健康检查"])
     app.include_router(im.router, tags=["即时通讯"])
+    app.include_router(learning.router, tags=["学习"])
     app.include_router(logs.router, tags=["日志"])
     app.include_router(mcp.router, tags=["MCP"])
     app.include_router(memory.router, tags=["记忆"])
@@ -859,6 +861,12 @@ async def start_api_server(
                     loop.close()
             except Exception:
                 pass
+            try:
+                from openakita.core.engine_bridge import clear_api_loop
+
+                clear_api_loop(loop if "loop" in locals() else None)
+            except Exception:
+                pass
 
     api_thread = threading.Thread(
         target=_api_thread,
@@ -919,6 +927,12 @@ async def start_api_server(
             logger.info("API proxy task cancelled, shutting down uvicorn...")
             server.should_exit = True
             await asyncio.to_thread(api_thread.join, 5.0)
+            try:
+                from openakita.core.engine_bridge import clear_api_loop
+
+                clear_api_loop(api_loop)
+            except Exception:
+                pass
 
     proxy_task = asyncio.create_task(_proxy())
     # Keep a handle to the app so the serve process can update late-bound

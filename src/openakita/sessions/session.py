@@ -145,6 +145,8 @@ class SessionContext:
     active_agents: list[str] = field(default_factory=list)
     # Delegation chain for the current request
     delegation_chain: list[dict] = field(default_factory=list)
+    # Top-level orchestration records for planner/todo/delegation executions
+    orchestration_records: list[dict] = field(default_factory=list)
     # Sub-agent work records — persisted traces of delegated tasks
     sub_agent_records: list[dict] = field(default_factory=list)
     # Task checkpoints — emitted by reasoning_engine.reason_stream for resume / timeline
@@ -383,6 +385,7 @@ class SessionContext:
             "handoff_events": self.handoff_events,
             "active_agents": self.active_agents,
             "delegation_chain": self.delegation_chain,
+            "orchestration_records": self.orchestration_records,
             "sub_agent_records": self.sub_agent_records,
             "task_checkpoints": self.task_checkpoints,
             "focus_terms": self.focus_terms,
@@ -407,6 +410,7 @@ class SessionContext:
             handoff_events=data.get("handoff_events", []),
             active_agents=data.get("active_agents", []),
             delegation_chain=data.get("delegation_chain", []),
+            orchestration_records=data.get("orchestration_records", []),
             sub_agent_records=data.get("sub_agent_records", []),
             task_checkpoints=data.get("task_checkpoints", []),
             focus_terms=data.get("focus_terms", []),
