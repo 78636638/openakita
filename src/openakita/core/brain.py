@@ -95,6 +95,20 @@ class Brain:
         self._compiler_circuit_open_at: float = 0.0
         self._compiler_auth_failed: bool = False
 
+        # defer_loading 缓存：工具列表不变时复用转换结果，避免每轮重复计算
+        # 缓存 key: (tools_signature, schema_budget)
+        # 缓存 value: (result, stats) —— stats 用于保持 defer_loading 日志输出
+        self._convert_tools_cache: dict[tuple, tuple] = {}
+        # 缓存容量上限：超过时按 FIFO 淘汰最旧条目，防止动态加载工具时无界增长
+        self._convert_tools_cache_max: int = 32
+        # 缓存插入顺序追踪（用于 FIFO 淘汰）
+        self._convert_tools_cache_order: list[tuple] = []
+        # 缓存统计：用于观测命中率
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+        # 自动注册到默认 handler_registry，确保工具变更时缓存自动失效
+        self._register_cache_invalidation_hook()
+
         # max_tokens=0 表示"使用合理默认值"：
         # - 对 OpenAI 兼容 API：使用端点配置值或兜底 16384（部分 API 如 NVIDIA NIM 默认极低）
         # - 对 Anthropic API：使用端点配置值或兜底 16384（该 API 强制要求此参数）
@@ -1090,6 +1104,73 @@ class Brain:
 
         return result
 
+    def clear_tools_cache(self) -> None:
+        """
+        清空 defer_loading 缓存。
+
+        由 SystemHandlerRegistry 的 register/unregister 回调自动触发，
+        也可由外部手动调用（例如工具热更新、配置变更后）。
+        """
+        cleared = len(self._convert_tools_cache)
+        self._convert_tools_cache.clear()
+        self._convert_tools_cache_order.clear()
+        if cleared:
+            logger.debug(
+                "[Brain] defer_loading 缓存已清空 (清理 %d 条目, hits=%d, misses=%d)",
+                cleared,
+                self._cache_hits,
+                self._cache_misses,
+            )
+
+    def get_tools_cache_stats(self) -> dict:
+        """获取缓存统计信息，用于观测。"""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total * 100) if total > 0 else 0.0
+        return {
+            "size": len(self._convert_tools_cache),
+            "max_size": self._convert_tools_cache_max,
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "hit_rate_pct": round(hit_rate, 2),
+        }
+
+    def prewarm_tools_cache(self, tools: list[ToolParam] | None = None) -> None:
+        """
+        预热 defer_loading 缓存（系统启动时调用，避免首轮 LLM 调用的冷启动）。
+
+        Args:
+            tools: 完整的工具列表。为 None 时，仅清空缓存（下次 LLM 调用时填充）。
+        """
+        if tools is not None:
+            # 主动调用一次 _convert_tools_to_llm 来填充缓存
+            self._convert_tools_to_llm(tools)
+            logger.info(
+                "[Brain] defer_loading 缓存已预热 (size=%d, stats=%s)",
+                len(self._convert_tools_cache),
+                self.get_tools_cache_stats(),
+            )
+        else:
+            # 不预热，但确保清空状态
+            self._convert_tools_cache.clear()
+            self._convert_tools_cache_order.clear()
+
+    def _register_cache_invalidation_hook(self) -> None:
+        """
+        注册到默认 handler_registry，使工具 register/unregister 时自动清空缓存。
+
+        注意：此方法在 __init__ 中调用，是幂等且轻量的。
+        如果 default_handler_registry 不可用，仅记录 DEBUG，不抛错（保证 Brain 可独立使用）。
+        """
+        try:
+            from ..tools.handlers import default_handler_registry
+
+            default_handler_registry.register_invalidation_callback(self.clear_tools_cache)
+            logger.debug("[Brain] 已注册缓存自动失效回调到 default_handler_registry")
+        except Exception as exc:
+            logger.debug(
+                "[Brain] 注册缓存失效回调失败（Brain 将独立工作）: %s", exc
+            )
+
     def _convert_tools_to_llm(self, tools: list[ToolParam] | None) -> list[Tool] | None:
         """将工具定义转换为 LLMClient Tool，兼容 Anthropic / OpenAI 两种格式。
 
@@ -1099,9 +1180,50 @@ class Brain:
         支持的格式：
         - Anthropic (内部): {"name": ..., "description": ..., "input_schema": {...}}
         - OpenAI:          {"type": "function", "function": {"name": ..., ...}}
+
+        性能优化：当 tools 列表和 schema_budget 不变时，直接复用上次结果，
+        避免每轮 ReAct 迭代重复扫描 ~100+ 工具并重复日志输出。
         """
         if not tools:
             return None
+
+        schema_budget = self._resolve_api_tools_schema_budget()
+
+        # ── 缓存命中：tools 列表与 schema_budget 未变 → 复用结果 ──
+        # signature 包含 (name, is_deferred, description_hash)，可检测：
+        # - 工具新增/删除（长度变化）
+        # - 工具描述热更新（description_hash 变化）
+        tools_signature = tuple(
+            (
+                tool.get("name", ""),
+                bool(tool.get("_deferred", False)),
+                hash(tool.get("detail") or tool.get("description", "")),
+            )
+            for tool in tools
+        )
+        cache_key = (tools_signature, schema_budget)
+        cached = self._convert_tools_cache.get(cache_key)
+        if cached is not None:
+            cached_result, cached_stats = cached
+            self._cache_hits += 1
+            # 命中时把 key 移到队尾（LRU-like：最近使用 → 不被淘汰）
+            if cache_key in self._convert_tools_cache_order:
+                self._convert_tools_cache_order.remove(cache_key)
+            self._convert_tools_cache_order.append(cache_key)
+            # 复用 stats 输出与未命中时一致的日志（不重算）
+            if cached_stats["deferred"]:
+                logger.info(
+                    "[Brain] defer_loading: deferred=%d total=%d schema_tokens~%d budget=%d "
+                    "always_available=%d promoted=%d (cached)",
+                    cached_stats["deferred"],
+                    len(tools),
+                    cached_stats["schema_tokens"],
+                    schema_budget,
+                    cached_stats["always_available"],
+                    cached_stats["promoted"],
+                )
+            return cached_result
+        self._cache_misses += 1
 
         result: list[Tool] = []
         skipped = 0
@@ -1110,7 +1232,6 @@ class Brain:
         deferred = 0
         promoted = 0
         always_available = 0
-        schema_budget = self._resolve_api_tools_schema_budget()
         schema_tokens = 0
         for tool in tools:
             name = tool.get("name", "")
@@ -1211,6 +1332,29 @@ class Brain:
                 len(tools),
                 always_available,
                 promoted,
+            )
+
+        # ── 写入缓存：供后续 ReAct 迭代复用 ──
+        # 同时跟踪插入顺序，用于超出容量上限时按 FIFO 淘汰最旧条目
+        # 这样在系统启动时 MCP/插件动态加载工具，不会导致缓存无界增长
+        if cache_key not in self._convert_tools_cache:
+            self._convert_tools_cache_order.append(cache_key)
+        self._convert_tools_cache[cache_key] = (
+            result if result else None,
+            {
+                "deferred": deferred,
+                "promoted": promoted,
+                "always_available": always_available,
+                "schema_tokens": schema_tokens,
+            },
+        )
+        # FIFO 淘汰：超出容量上限时移除最旧的条目
+        while len(self._convert_tools_cache_order) > self._convert_tools_cache_max:
+            oldest_key = self._convert_tools_cache_order.pop(0)
+            self._convert_tools_cache.pop(oldest_key, None)
+            logger.debug(
+                "[Brain] defer_loading 缓存淘汰最旧条目 (max=%d)",
+                self._convert_tools_cache_max,
             )
 
         return result if result else None

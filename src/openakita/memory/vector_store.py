@@ -149,14 +149,50 @@ class VectorStore:
                 return  # 已有线程在初始化
             self._init_state = "loading"
 
+        import time as _time
+
+        t_start = _time.monotonic()
+        logger.info(f"[VectorStore] 后台加载开始 elapsed=0.0s (model={self.model_name})")
+
+        # 心跳线程：每 5s 报告一次进度，避免用户感知"假死"
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                stop_heartbeat.wait(5.0)
+                if stop_heartbeat.is_set():
+                    break
+                with self._lock:
+                    state = self._init_state
+                elapsed = _time.monotonic() - t_start
+                logger.info(
+                    f"[VectorStore] 后台加载中 elapsed={elapsed:.1f}s state={state} "
+                    f"(如持续超过 60s 请检查网络或模型源)"
+                )
+
+        hb_thread = threading.Thread(
+            target=_heartbeat, name="VectorStore-heartbeat", daemon=True
+        )
+        hb_thread.start()
+
         try:
             self._do_initialize_inner()
         except Exception:
-            pass  # 错误已在 inner 中处理
+            pass
+        finally:
+            stop_heartbeat.set()
+            elapsed = _time.monotonic() - t_start
+            with self._lock:
+                final_state = self._init_state
+            logger.info(
+                f"[VectorStore] 后台加载结束 elapsed={elapsed:.1f}s state={final_state}"
+            )
 
     def _do_initialize_inner(self) -> None:
         """初始化核心逻辑，包含模型下载和 ChromaDB 初始化。"""
         import time as _time
+
+        t_total = _time.monotonic()
 
         # ── 关键：在导入 sentence_transformers 之前就配置好 HF_ENDPOINT ──
         # sentence_transformers 导入时会触发 huggingface_hub 导入，
@@ -190,6 +226,7 @@ class VectorStore:
             # 初始化 embedding 模型（支持多源下载）
             from .model_hub import load_embedding_model
 
+            t0 = _time.monotonic()
             logger.info(
                 f"[VectorStore] 正在加载 embedding 模型: {self.model_name} "
                 f"(source={self.download_source})"
@@ -199,8 +236,14 @@ class VectorStore:
                 source=self.download_source,
                 device=self.device,
             )
+            t1 = _time.monotonic()
+            logger.info(
+                f"[VectorStore] embedding 模型加载完成 "
+                f"duration={t1 - t0:.1f}s total={t1 - t_total:.1f}s"
+            )
 
             # 初始化 ChromaDB
+            t2 = _time.monotonic()
             chromadb_dir = self.data_dir / "chromadb"
             chromadb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -209,6 +252,10 @@ class VectorStore:
             client = _chromadb.PersistentClient(
                 path=str(chromadb_dir),
                 settings=Settings(anonymized_telemetry=False),
+            )
+            t3 = _time.monotonic()
+            logger.info(
+                f"[VectorStore] ChromaDB 初始化完成 duration={t3 - t2:.1f}s total={t3 - t_total:.1f}s"
             )
 
             # 获取或创建 collection

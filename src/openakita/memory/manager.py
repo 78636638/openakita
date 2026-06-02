@@ -1272,6 +1272,28 @@ class MemoryManager:
         mem_type = type_map.get(item.get("type", "FACT"), MemoryType.FACT)
         importance = item.get("importance", 0.5)
         content = item.get("content", "").strip()
+        # #region debug-point D:save-extracted-item-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _db_path = getattr(self.store.db, "_db_path", None)
+        _before = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:_save_extracted_item:start",
+            "[DEBUG] memory save_extracted_item start",
+            {
+                "episode_id": episode_id or "",
+                "type": item.get("type", ""),
+                "importance": importance,
+                "content_preview": content[:120],
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
 
         # PERMANENT 是最贵的层（不会被衰减、永远进 USER.md / MEMORY.md），
         # 因此只允许 *用户身份层* 的记忆走到这里。否则一次任务记录就被永久化，
@@ -1369,6 +1391,24 @@ class MemoryManager:
             user_id=write_user,
             workspace_id=write_workspace,
         )
+        # #region debug-point D:save-extracted-item-finish
+        _after = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:_save_extracted_item:finish",
+            "[DEBUG] memory save_extracted_item finish",
+            {
+                "episode_id": episode_id or "",
+                "saved_id": saved_id or "",
+                "after_main": _after.get("main", {}),
+                "main_changed": _before.get("main", {}) != _after.get("main", {}),
+            },
+        )
+        # #endregion
 
         return saved_id
 
@@ -1534,6 +1574,27 @@ class MemoryManager:
         """结束会话: 生成 Episode + 双轨提取（用户画像 + 任务经验）+ 引用评分"""
         if not self._current_session_id:
             return
+        # #region debug-point D:end-session-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _db_path = getattr(self.store.db, "_db_path", None)
+        _before = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:end_session:start",
+            "[DEBUG] memory end_session start",
+            {
+                "session_id": self._current_session_id,
+                "task_description": task_description[:120],
+                "turn_count": len(self._session_turns),
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
 
         backends = self._iter_memory_backends()
         if backends:
@@ -1695,6 +1756,24 @@ class MemoryManager:
         self._current_session_id = None
         self._session_turns = []
         self._set_retrieval_scope_context()
+        # #region debug-point D:end-session-finish
+        _after = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:end_session:finish",
+            "[DEBUG] memory end_session finish",
+            {
+                "session_id": session_id,
+                "after_main": _after.get("main", {}),
+                "main_changed": _before.get("main", {}) != _after.get("main", {}),
+                "pending_tasks": len(self._pending_tasks),
+            },
+        )
+        # #endregion
 
     def _enqueue_session_turns_for_extraction(
         self, session_id: str, turns: list[ConversationTurn]
@@ -1724,13 +1803,71 @@ class MemoryManager:
         if not self._pending_tasks:
             return
         pending = list(self._pending_tasks)
+        # #region debug-point D:await-pending-tasks-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _db_path = getattr(self.store.db, "_db_path", None)
+        _before = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:await_pending_tasks:start",
+            "[DEBUG] memory await_pending_tasks start",
+            {
+                "timeout": timeout,
+                "pending_tasks": len(pending),
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
         logger.info(f"[Memory] Awaiting {len(pending)} pending tasks (timeout={timeout}s)...")
         done, not_done = await asyncio.wait(pending, timeout=timeout)
         if not_done:
+            # #region debug-point D:await-pending-tasks-timeout
+            _mid = (
+                _build_quick_check_fingerprint(_db_path)
+                if _db_path is not None
+                else {"main": {"exists": False}}
+            )
+            _debug_report(
+                "D",
+                "openakita.memory.manager:await_pending_tasks:timeout",
+                "[DEBUG] memory await_pending_tasks timeout",
+                {
+                    "timeout": timeout,
+                    "done_tasks": len(done),
+                    "not_done_tasks": len(not_done),
+                    "after_main": _mid.get("main", {}),
+                    "main_changed": _before.get("main", {}) != _mid.get("main", {}),
+                },
+            )
+            # #endregion
             logger.warning(f"[Memory] {len(not_done)} tasks did not complete within timeout")
             for t in not_done:
                 t.cancel()
         self._pending_tasks.clear()
+        # #region debug-point D:await-pending-tasks-finish
+        _after = (
+            _build_quick_check_fingerprint(_db_path)
+            if _db_path is not None
+            else {"main": {"exists": False}}
+        )
+        _debug_report(
+            "D",
+            "openakita.memory.manager:await_pending_tasks:finish",
+            "[DEBUG] memory await_pending_tasks finish",
+            {
+                "timeout": timeout,
+                "done_tasks": len(done),
+                "not_done_tasks": len(not_done),
+                "after_main": _after.get("main", {}),
+                "main_changed": _before.get("main", {}) != _after.get("main", {}),
+            },
+        )
+        # #endregion
 
     def _safe_enqueue_extraction(
         self,

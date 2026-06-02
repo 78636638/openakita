@@ -58,6 +58,9 @@ class SystemHandlerRegistry:
         # explicit register(tool_classes=) param and handler.TOOL_CLASSES attr.
         # Used by policy_v2.ApprovalClassifier via .get_tool_class() lookup.
         self._tool_classes: dict[str, tuple[Any, Any]] = {}
+        # 工具注册表变更回调：register/unregister 工具时触发
+        # Brain 等消费者可注册回调以实现缓存自动失效
+        self._change_callbacks: list[Callable[[], None]] = []
 
     def register(
         self,
@@ -140,6 +143,7 @@ class SystemHandlerRegistry:
             handler_name,
             len(tool_names or []),
         )
+        self._fire_change_callbacks(reason="register", handler_name=handler_name)
 
     def _collect_tool_classes(
         self,
@@ -229,8 +233,41 @@ class SystemHandlerRegistry:
             for tool in removed_tools:
                 self._tool_classes.pop(tool, None)
             logger.info(f"Unregistered system handler: {handler_name}")
+            self._fire_change_callbacks(reason="unregister", handler_name=handler_name)
             return True
         return False
+
+    def register_invalidation_callback(self, callback: Callable[[], None]) -> None:
+        """
+        注册工具变更回调。当 register/unregister 工具时自动触发。
+
+        用法（典型场景：Brain 的 defer_loading 缓存自动失效）：
+            registry.register_invalidation_callback(brain.clear_tools_cache)
+
+        回调应保持轻量（清缓存等），避免在此处做耗时操作。
+        """
+        self._change_callbacks.append(callback)
+
+    def unregister_invalidation_callback(self, callback: Callable[[], None]) -> bool:
+        """注销已注册的变更回调。返回是否成功找到并移除。"""
+        try:
+            self._change_callbacks.remove(callback)
+            return True
+        except ValueError:
+            return False
+
+    def _fire_change_callbacks(self, *, reason: str, handler_name: str | None = None) -> None:
+        """内部方法：触发所有已注册的变更回调。"""
+        for cb in self._change_callbacks:
+            try:
+                cb()
+            except Exception as exc:
+                logger.warning(
+                    "[Registry] 变更回调执行失败 (reason=%s, handler=%s): %s",
+                    reason,
+                    handler_name,
+                    exc,
+                )
 
     def get_handler(self, handler_name: str) -> HandlerFunc | None:
         """获取处理器"""

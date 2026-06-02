@@ -857,7 +857,7 @@ class FeishuAdapter(ChannelAdapter):
         ).register_p2_im_message_receive_v1(self._on_message_receive)
         # 注册消息已读事件，避免 SDK 报 "processor not found" ERROR 日志
         try:
-            builder = builder.register_p2_im_message_read_v1(self._on_message_read)
+            builder = builder.register_p2_im_message_message_read_v1(self._on_message_read)
         except AttributeError:
             pass
         # 注册机器人进入会话事件

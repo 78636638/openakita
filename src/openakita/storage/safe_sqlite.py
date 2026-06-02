@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sqlite3
 import time
+import urllib.request
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,6 +100,43 @@ class SQLiteUnavailable(Exception):
 
 
 _SYNC_FOLDER_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive")
+_QUICK_CHECK_STAMP_VERSION = 1
+
+
+# #region debug-point A:sqlite-debug-report
+def _debug_report(hypothesis_id: str, location: str, msg: str, data: dict[str, Any]) -> None:
+    _env = Path(".dbg/sqlite-quick-check-block.env")
+    _url = "http://127.0.0.1:7777/event"
+    _session = "sqlite-quick-check-block"
+    try:
+        if _env.exists():
+            for _line in _env.read_text(encoding="utf-8").splitlines():
+                if _line.startswith("DEBUG_SERVER_URL="):
+                    _url = _line.split("=", 1)[1].strip() or _url
+                elif _line.startswith("DEBUG_SESSION_ID="):
+                    _session = _line.split("=", 1)[1].strip() or _session
+        _payload = {
+            "sessionId": _session,
+            "runId": os.environ.get("OPENAKITA_DEBUG_RUN_ID", "pre-fix"),
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": msg,
+            "data": data,
+            "ts": int(time.time() * 1000),
+        }
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _url,
+                data=json.dumps(_payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        return
+
+
+# #endregion
 
 
 def _is_sync_folder_path(path: Path) -> bool:
@@ -162,6 +201,94 @@ def _hot_journal_orphan(path: Path) -> tuple[int, int] | None:
     return None
 
 
+def _quick_check_stamp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.quickcheck.json")
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _sidecar_fingerprint(path: Path) -> dict[str, Any]:
+    payload = _file_fingerprint(path)
+    if not payload.get("exists"):
+        return {"exists": False}
+    if int(payload.get("size", 0) or 0) <= 0:
+        return {"exists": False}
+    return payload
+
+
+def _build_quick_check_fingerprint(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    return {
+        "path": str(resolved),
+        "main": _file_fingerprint(path),
+    }
+
+
+def _load_quick_check_stamp(path: Path) -> dict[str, Any] | None:
+    stamp_path = _quick_check_stamp_path(path)
+    try:
+        payload = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_quick_check_stamp(path: Path) -> None:
+    stamp_path = _quick_check_stamp_path(path)
+    payload = {
+        "version": _QUICK_CHECK_STAMP_VERSION,
+        "checked_at": time.time(),
+        "fingerprint": _build_quick_check_fingerprint(path),
+    }
+    temp_path = stamp_path.with_name(f"{stamp_path.name}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temp_path.replace(stamp_path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+
+
+def _clear_quick_check_stamp(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        _quick_check_stamp_path(path).unlink()
+
+
+def _should_skip_quick_check(path: Path) -> bool:
+    if os.environ.get("OPENAKITA_FORCE_SQLITE_QUICK_CHECK") == "1":
+        return False
+    payload = _load_quick_check_stamp(path)
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("version") != _QUICK_CHECK_STAMP_VERSION:
+        return False
+    return payload.get("fingerprint") == _build_quick_check_fingerprint(path)
+
+
+def _quick_check_cache_state(path: Path) -> dict[str, Any]:
+    payload = _load_quick_check_stamp(path) or {}
+    current = _build_quick_check_fingerprint(path)
+    stamp_fingerprint = payload.get("fingerprint") if isinstance(payload, dict) else None
+    return {
+        "force_full_check": os.environ.get("OPENAKITA_FORCE_SQLITE_QUICK_CHECK") == "1",
+        "stamp_exists": bool(payload),
+        "stamp_version": payload.get("version") if isinstance(payload, dict) else None,
+        "stamp_main": (stamp_fingerprint or {}).get("main", {}) if isinstance(stamp_fingerprint, dict) else {},
+        "current_main": current.get("main", {}),
+        "matches": stamp_fingerprint == current if isinstance(stamp_fingerprint, dict) else False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sync API
 # ---------------------------------------------------------------------------
@@ -174,13 +301,57 @@ def quick_check_or_raise_sync(conn: sqlite3.Connection, path: Path | None = None
     one implementation. Existing ``MemoryStorage`` code keeps its own
     method as a thin wrapper for backwards compatibility.
     """
+    _started_at = time.perf_counter()
+    _path = Path(path) if path is not None else None
+    _main_size = _path.stat().st_size if _path and _path.exists() else None
+    _wal = Path(f"{_path}-wal") if _path else None
+    _wal_size = _wal.stat().st_size if _wal and _wal.exists() else None
+    _shm = Path(f"{_path}-shm") if _path else None
+    _shm_size = _shm.stat().st_size if _shm and _shm.exists() else None
+    # #region debug-point A:quick-check-start
+    _debug_report(
+        "A",
+        "openakita.storage.safe_sqlite:quick_check_or_raise_sync:start",
+        "[DEBUG] sqlite quick_check start",
+        {
+            "path": str(_path) if _path else "",
+            "main_size": _main_size,
+            "wal_size": _wal_size,
+            "shm_size": _shm_size,
+        },
+    )
+    # #endregion
     try:
         row = conn.execute("PRAGMA quick_check").fetchone()
     except sqlite3.DatabaseError as e:
+        # #region debug-point B:quick-check-db-error
+        _debug_report(
+            "B",
+            "openakita.storage.safe_sqlite:quick_check_or_raise_sync:error",
+            "[DEBUG] sqlite quick_check database error",
+            {
+                "path": str(_path) if _path else "",
+                "elapsed_ms": round((time.perf_counter() - _started_at) * 1000, 2),
+                "error": str(e),
+            },
+        )
+        # #endregion
         if _looks_like_corruption(e):
             raise SQLiteUnavailable("corrupted", path=path, details=str(e)) from e
         raise
     result = str(row[0] if row else "").strip().lower()
+    # #region debug-point A:quick-check-finish
+    _debug_report(
+        "A",
+        "openakita.storage.safe_sqlite:quick_check_or_raise_sync:finish",
+        "[DEBUG] sqlite quick_check finished",
+        {
+            "path": str(_path) if _path else "",
+            "elapsed_ms": round((time.perf_counter() - _started_at) * 1000, 2),
+            "result": result,
+        },
+    )
+    # #endregion
     if result != "ok":
         raise SQLiteUnavailable("corrupted", path=path, details=result or "quick_check failed")
 
@@ -205,6 +376,21 @@ def safe_open_sync(
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    # #region debug-point D:safe-open-start
+    _debug_report(
+        "D",
+        "openakita.storage.safe_sqlite:safe_open_sync:start",
+        "[DEBUG] sqlite safe_open_sync start",
+        {
+            "path": str(p),
+            "want_wal": want_wal,
+            "busy_ms": busy_ms,
+            "run_quick_check": run_quick_check,
+            "main_exists": p.exists(),
+            "main_size": p.stat().st_size if p.exists() else None,
+        },
+    )
+    # #endregion
 
     if _is_sync_folder_path(p):
         raise SQLiteUnavailable("path_in_sync_folder", path=p, details=str(p))
@@ -231,14 +417,57 @@ def safe_open_sync(
             if foreign_keys:
                 conn.execute("PRAGMA foreign_keys=ON")
             if run_quick_check:
-                quick_check_or_raise_sync(conn, path=p)
+                if _should_skip_quick_check(p):
+                    # #region debug-point D:quick-check-skip
+                    _debug_report(
+                        "D",
+                        "openakita.storage.safe_sqlite:safe_open_sync:quick_check_skipped",
+                        "[DEBUG] sqlite quick_check skipped via cache",
+                        {"path": str(p)},
+                    )
+                    # #endregion
+                else:
+                    # #region debug-point D:quick-check-cache-miss
+                    _debug_report(
+                        "D",
+                        "openakita.storage.safe_sqlite:safe_open_sync:quick_check_cache_miss",
+                        "[DEBUG] sqlite quick_check cache miss",
+                        {"path": str(p), **_quick_check_cache_state(p)},
+                    )
+                    # #endregion
+                    quick_check_or_raise_sync(conn, path=p)
+                    _store_quick_check_stamp(p)
+            # #region debug-point D:safe-open-success
+            _debug_report(
+                "D",
+                "openakita.storage.safe_sqlite:safe_open_sync:success",
+                "[DEBUG] sqlite safe_open_sync success",
+                {
+                    "path": str(p),
+                    "run_quick_check": run_quick_check,
+                },
+            )
+            # #endregion
             return conn
         except SQLiteUnavailable:
+            _clear_quick_check_stamp(p)
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
             raise
         except sqlite3.DatabaseError as e:
+            # #region debug-point B:safe-open-db-error
+            _debug_report(
+                "B",
+                "openakita.storage.safe_sqlite:safe_open_sync:db_error",
+                "[DEBUG] sqlite safe_open_sync database error",
+                {
+                    "path": str(p),
+                    "error": str(e),
+                },
+            )
+            # #endregion
+            _clear_quick_check_stamp(p)
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
@@ -335,14 +564,20 @@ async def safe_open_async(
             if foreign_keys:
                 await conn.execute("PRAGMA foreign_keys=ON")
             if run_quick_check:
-                await quick_check_or_raise_async(conn, path=p)
+                if _should_skip_quick_check(p):
+                    pass
+                else:
+                    await quick_check_or_raise_async(conn, path=p)
+                    _store_quick_check_stamp(p)
             return conn
         except SQLiteUnavailable:
+            _clear_quick_check_stamp(p)
             if conn is not None:
                 with contextlib.suppress(Exception):
                     await conn.close()
             raise
         except sqlite3.DatabaseError as e:
+            _clear_quick_check_stamp(p)
             if conn is not None:
                 with contextlib.suppress(Exception):
                     await conn.close()

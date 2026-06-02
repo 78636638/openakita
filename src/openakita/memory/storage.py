@@ -23,6 +23,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,21 @@ class MemoryStorage:
     # ======================================================================
 
     def _init_db(self) -> None:
+        _started_at = datetime.now()
+        # #region debug-point D:memory-init-start
+        from openakita.storage.safe_sqlite import _debug_report
+
+        _debug_report(
+            "D",
+            "openakita.memory.storage:MemoryStorage._init_db:start",
+            "[DEBUG] memory storage init start",
+            {
+                "db_path": str(self._db_path),
+                "exists": self._db_path.exists(),
+                "main_size": self._db_path.stat().st_size if self._db_path.exists() else None,
+            },
+        )
+        # #endregion
         # `path_in_sync_folder` is a domain concern for the memory subsystem
         # (we surface it through MemoryStorageUnavailable so memory_repair
         # can recognise it), so we keep the pre-check here even though
@@ -132,6 +148,19 @@ class MemoryStorage:
                 check_same_thread=False,
             )
         except SQLiteUnavailable as e:
+            # #region debug-point B:memory-init-open-error
+            _debug_report(
+                "B",
+                "openakita.memory.storage:MemoryStorage._init_db:open_error",
+                "[DEBUG] memory storage init open failed",
+                {
+                    "db_path": str(self._db_path),
+                    "elapsed_ms": round((datetime.now() - _started_at).total_seconds() * 1000, 2),
+                    "reason": e.reason,
+                    "details": e.details,
+                },
+            )
+            # #endregion
             # Map safe_sqlite reasons to the historical MemoryStorageUnavailable
             # reason vocabulary so callers (memory_repair UI, telemetry events,
             # tests) keep working unchanged. "corrupted" → "schema_corrupt"
@@ -144,6 +173,17 @@ class MemoryStorage:
             ) from e
 
         self._conn = conn
+        # #region debug-point D:memory-init-opened
+        _debug_report(
+            "D",
+            "openakita.memory.storage:MemoryStorage._init_db:opened",
+            "[DEBUG] memory storage init opened",
+            {
+                "db_path": str(self._db_path),
+                "elapsed_ms": round((datetime.now() - _started_at).total_seconds() * 1000, 2),
+            },
+        )
+        # #endregion
         try:
             current_version = self._get_schema_version()
             if current_version > _SCHEMA_VERSION:
@@ -156,6 +196,18 @@ class MemoryStorage:
                 self._migrate_schema(current_version)
             else:
                 self._create_tables()
+            # #region debug-point D:memory-init-finish
+            _debug_report(
+                "D",
+                "openakita.memory.storage:MemoryStorage._init_db:finish",
+                "[DEBUG] memory storage init finished",
+                {
+                    "db_path": str(self._db_path),
+                    "elapsed_ms": round((datetime.now() - _started_at).total_seconds() * 1000, 2),
+                    "schema_version": current_version,
+                },
+            )
+            # #endregion
         except MemoryStorageUnavailable:
             self._cleanup_failed_init(conn)
             raise
@@ -977,6 +1029,23 @@ class MemoryStorage:
     def save_memory(self, memory: dict) -> None:
         if not self._conn:
             return
+        # #region debug-point D:save-memory-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _before = _build_quick_check_fingerprint(self._db_path)
+        _started_at = time.perf_counter()
+        _debug_report(
+            "D",
+            "openakita.memory.storage:save_memory:start",
+            "[DEBUG] memory save_memory start",
+            {
+                "db_path": str(self._db_path),
+                "memory_id": str(memory.get("id", "")),
+                "memory_type": str(memory.get("type", "")),
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
         now = datetime.now().isoformat()
         with self._lock:
             try:
@@ -1018,6 +1087,22 @@ class MemoryStorage:
                     ),
                 )
                 self._conn.commit()
+                # #region debug-point D:save-memory-finish
+                _after = _build_quick_check_fingerprint(self._db_path)
+                _debug_report(
+                    "D",
+                    "openakita.memory.storage:save_memory:finish",
+                    "[DEBUG] memory save_memory finished",
+                    {
+                        "db_path": str(self._db_path),
+                        "memory_id": str(memory.get("id", "")),
+                        "memory_type": str(memory.get("type", "")),
+                        "elapsed_ms": round((time.perf_counter() - _started_at) * 1000, 2),
+                        "after_main": _after.get("main", {}),
+                        "main_changed": _before.get("main", {}) != _after.get("main", {}),
+                    },
+                )
+                # #endregion
             except Exception as e:
                 if _is_db_locked(e):
                     raise
@@ -2001,6 +2086,24 @@ class MemoryStorage:
         """
         if not self._conn:
             return
+        # #region debug-point D:save-turn-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _before = _build_quick_check_fingerprint(self._db_path)
+        _started_at = time.perf_counter()
+        _debug_report(
+            "D",
+            "openakita.memory.storage:save_turn:start",
+            "[DEBUG] memory save_turn start",
+            {
+                "db_path": str(self._db_path),
+                "session_id": session_id,
+                "role": role,
+                "turn_index": turn_index,
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
         ts = timestamp or datetime.now().isoformat()
         has_tools = bool(tool_calls)
         # Only persist non-empty metadata; saves a few bytes per row
@@ -2041,6 +2144,23 @@ class MemoryStorage:
                     ),
                 )
                 self._conn.commit()
+                # #region debug-point D:save-turn-finish
+                _after = _build_quick_check_fingerprint(self._db_path)
+                _debug_report(
+                    "D",
+                    "openakita.memory.storage:save_turn:finish",
+                    "[DEBUG] memory save_turn finished",
+                    {
+                        "db_path": str(self._db_path),
+                        "session_id": session_id,
+                        "role": role,
+                        "turn_index": turn_index,
+                        "elapsed_ms": round((time.perf_counter() - _started_at) * 1000, 2),
+                        "after_main": _after.get("main", {}),
+                        "main_changed": _before.get("main", {}) != _after.get("main", {}),
+                    },
+                )
+                # #endregion
             except Exception as e:
                 if _is_db_locked(e):
                     raise
@@ -2662,10 +2782,37 @@ class MemoryStorage:
             return []
 
     def close(self) -> None:
+        # #region debug-point D:close-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _before = _build_quick_check_fingerprint(self._db_path)
+        _debug_report(
+            "D",
+            "openakita.memory.storage:close:start",
+            "[DEBUG] memory storage close start",
+            {
+                "db_path": str(self._db_path),
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
         with self._lock:
             if self._conn:
                 self._conn.close()
                 self._conn = None
+        # #region debug-point D:close-finish
+        _after = _build_quick_check_fingerprint(self._db_path)
+        _debug_report(
+            "D",
+            "openakita.memory.storage:close:finish",
+            "[DEBUG] memory storage close finish",
+            {
+                "db_path": str(self._db_path),
+                "after_main": _after.get("main", {}),
+                "main_changed": _before.get("main", {}) != _after.get("main", {}),
+            },
+        )
+        # #endregion
         key = str(self._db_path.resolve())
         with _instance_lock:
             if _instance_registry.get(key) is self:
@@ -2682,6 +2829,21 @@ class MemoryStorage:
         await _asyncio.to_thread(self.close)
 
     def checkpoint_and_close(self, *, truncate: bool = True) -> None:
+        # #region debug-point D:checkpoint-close-start
+        from openakita.storage.safe_sqlite import _build_quick_check_fingerprint, _debug_report
+
+        _before = _build_quick_check_fingerprint(self._db_path)
+        _debug_report(
+            "D",
+            "openakita.memory.storage:checkpoint_and_close:start",
+            "[DEBUG] memory checkpoint_and_close start",
+            {
+                "db_path": str(self._db_path),
+                "truncate": truncate,
+                "before_main": _before.get("main", {}),
+            },
+        )
+        # #endregion
         with self._lock:
             conn = self._conn
             if conn is None:
@@ -2692,6 +2854,20 @@ class MemoryStorage:
             finally:
                 conn.close()
                 self._conn = None
+        # #region debug-point D:checkpoint-close-finish
+        _after = _build_quick_check_fingerprint(self._db_path)
+        _debug_report(
+            "D",
+            "openakita.memory.storage:checkpoint_and_close:finish",
+            "[DEBUG] memory checkpoint_and_close finish",
+            {
+                "db_path": str(self._db_path),
+                "truncate": truncate,
+                "after_main": _after.get("main", {}),
+                "main_changed": _before.get("main", {}) != _after.get("main", {}),
+            },
+        )
+        # #endregion
         key = str(self._db_path.resolve())
         with _instance_lock:
             if _instance_registry.get(key) is self:

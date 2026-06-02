@@ -107,6 +107,23 @@ class SubTask:
 class TaskPlanner:
     """Plans and executes sub-tasks via LLM decomposition."""
 
+    PLANNER_UNDERSTANDING_SYSTEM_PROMPT = """\
+You are a task understanding extractor for planning.
+
+Read the user request and extract planning-critical constraints before task decomposition.
+
+Output strict JSON object only, no markdown, no explanation:
+{
+  "goal": "one sentence",
+  "hard_constraints": ["constraint 1"],
+  "deliverables": ["deliverable 1"],
+  "rerun_required": true,
+  "regenerate_required": true,
+  "resend_required": true,
+  "must_cover_terms": ["term1"]
+}
+"""
+
     PLANNER_SYSTEM_PROMPT = """\
 You are a Task Planner. Decompose user requests into executable sub-tasks.
 
@@ -199,7 +216,81 @@ Output format:
         self._last_learning_usage_summary = None
         learning_actions = self._collect_learning_candidate_actions(task_description)
         rule_based = self._build_rule_based_plan(task_description, available_tools or [])
+        understanding = await self._understand_task_for_planning(task_description, context=context)
+        _coverage_tokens = [
+            token
+            for token in ("国内", "中文", "真实", "新闻", "新能源", "乱象", "PPT", "飞书", "重新", "再次")
+            if token in str(task_description or "")
+        ]
+        # #region debug-point B:planner-entry
+        import urllib.request as _debug_urlrequest
+        _debug_u, _debug_s = "http://127.0.0.1:7777/event", "todo-plan-quality"
+        try:
+            with open(".dbg/todo-plan-quality.env", encoding="utf-8") as _debug_f:
+                _debug_c = _debug_f.read()
+            _debug_u = next(
+                (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SERVER_URL=")),
+                _debug_u,
+            )
+            _debug_s = next(
+                (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SESSION_ID=")),
+                _debug_s,
+            )
+        except Exception:
+            pass
+        try:
+            _debug_payload = {
+                "sessionId": _debug_s,
+                "runId": "pre-fix",
+                "hypothesisId": "B",
+                "location": "openakita.core.task_planner:analyze",
+                "msg": "[DEBUG] planner analyze entry",
+                "data": {
+                    "task_description": str(task_description or "")[:500],
+                    "context": str(context or "")[:240],
+                    "available_tools_count": len(available_tools or []),
+                    "coverage_tokens": _coverage_tokens,
+                    "rule_based_candidate": bool(rule_based),
+                    "learning_action_count": len(learning_actions or []),
+                    "understanding": understanding,
+                },
+            }
+            _debug_req = _debug_urlrequest.Request(
+                _debug_u,
+                data=json.dumps(_debug_payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+        except Exception:
+            pass
+        # #endregion
         if rule_based:
+            # #region debug-point C:planner-rule-based
+            try:
+                _debug_payload = {
+                    "sessionId": _debug_s,
+                    "runId": "pre-fix",
+                    "hypothesisId": "C",
+                    "location": "openakita.core.task_planner:analyze",
+                    "msg": "[DEBUG] planner used rule-based plan",
+                    "data": {
+                        "task_description": str(task_description or "")[:500],
+                        "coverage_tokens": _coverage_tokens,
+                        "steps": [
+                            {"id": str(task.id), "description": str(task.description)[:240]}
+                            for task in rule_based[:8]
+                        ],
+                    },
+                }
+                _debug_req = _debug_urlrequest.Request(
+                    _debug_u,
+                    data=json.dumps(_debug_payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+            except Exception:
+                pass
+            # #endregion
             logger.info(
                 "[TaskPlanner] Using rule-based external action plan for task: %s",
                 task_description[:120],
@@ -221,6 +312,9 @@ Output format:
         user_msg = f"Task: {task_description}\n\n"
         if context:
             user_msg += f"Context: {context}\n\n"
+        if understanding:
+            user_msg += "Planning understanding:\n"
+            user_msg += json.dumps(understanding, ensure_ascii=False, indent=2) + "\n\n"
         learning_context = self._build_learning_context(learning_actions)
         learning_context_applied = bool(learning_context)
         if learning_context:
@@ -247,6 +341,54 @@ Output format:
                 )
                 content = response.content if hasattr(response, "content") else str(response)
             parsed = self._parse_sub_tasks(content)
+            _planned_descriptions = [str(task.description or "") for task in parsed[:8]]
+            _covered_tokens = [
+                token for token in _coverage_tokens if any(token in desc for desc in _planned_descriptions)
+            ]
+            missing_constraints = self._find_missing_understanding_constraints(understanding, parsed)
+            # #region debug-point D:planner-llm-output
+            try:
+                _debug_payload = {
+                    "sessionId": _debug_s,
+                    "runId": "pre-fix",
+                    "hypothesisId": "D",
+                    "location": "openakita.core.task_planner:analyze",
+                    "msg": "[DEBUG] planner llm output parsed",
+                    "data": {
+                        "task_description": str(task_description or "")[:500],
+                        "raw_output_preview": str(content or "")[:1200],
+                        "parsed_step_count": len(parsed),
+                        "steps": [
+                            {"id": str(task.id), "description": str(task.description)[:240]}
+                            for task in parsed[:8]
+                        ],
+                        "coverage_tokens": _coverage_tokens,
+                        "covered_tokens": _covered_tokens,
+                        "missing_constraints": missing_constraints,
+                    },
+                }
+                _debug_req = _debug_urlrequest.Request(
+                    _debug_u,
+                    data=json.dumps(_debug_payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+            except Exception:
+                pass
+            # #endregion
+            if missing_constraints:
+                refined = await self._retry_plan_with_missing_constraints(
+                    task_description=task_description,
+                    context=context,
+                    max_sub_tasks=max_sub_tasks,
+                    system=system,
+                    understanding=understanding,
+                    previous_plan=parsed,
+                    missing_constraints=missing_constraints,
+                )
+                if refined:
+                    parsed = refined
+            parsed = self._enforce_understanding_constraints_on_plan(understanding, parsed)
             planned, usage_summary = self._apply_learning_candidate_actions(
                 parsed,
                 learning_actions,
@@ -278,6 +420,259 @@ Output format:
             usage_summary["planning_mode"] = "fallback"
             self._last_learning_usage_summary = usage_summary
             return planned
+
+    async def _understand_task_for_planning(
+        self,
+        task_description: str,
+        *,
+        context: str = "",
+    ) -> dict[str, Any]:
+        understanding = self._build_rule_based_understanding(task_description)
+        thinker = getattr(self._brain, "think_lightweight", None) if self._brain is not None else None
+        if not callable(thinker):
+            return understanding
+
+        prompt = f"Task: {task_description}\n"
+        if context:
+            prompt += f"Context: {context}\n"
+        prompt += "\nExtract planning-critical constraints."
+
+        try:
+            response = await thinker(
+                prompt=prompt,
+                system=self.PLANNER_UNDERSTANDING_SYSTEM_PROMPT,
+                max_tokens=1024,
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+            parsed = self._extract_json_payload(str(content or ""))
+            if isinstance(parsed, dict):
+                understanding = self._merge_planning_understanding(understanding, parsed)
+        except Exception as exc:
+            logger.debug("[TaskPlanner] understanding extraction failed: %s", exc)
+        return understanding
+
+    @staticmethod
+    def _build_rule_based_understanding(task_description: str) -> dict[str, Any]:
+        text = str(task_description or "").strip()
+        normalized = text.lower()
+        constraints: list[str] = []
+        deliverables: list[str] = []
+        must_cover_terms: list[str] = []
+
+        for token in ("国内", "中文", "真实", "新闻", "新能源", "乱象", "PPT", "飞书"):
+            if token in text:
+                must_cover_terms.append(token)
+        if "重新" in text or "重做" in text:
+            must_cover_terms.append("重新")
+            constraints.append("需要重新执行已有任务而不是复用旧结果")
+        if "再次" in text or "重新推送" in text or "重发" in text:
+            must_cover_terms.append("再次")
+            constraints.append("需要再次发送或重新交付")
+        if "国内" in text or "国产" in text:
+            constraints.append("数据来源限定为国内来源")
+        if "中文" in text:
+            constraints.append("数据与输出需使用中文来源或中文内容")
+        if "真实" in text:
+            constraints.append("必须使用真实可验证数据，避免虚构和未经证实信息")
+        if "新闻" in text:
+            constraints.append("需要检索新闻报道而不是泛化总结")
+        if "ppt" in normalized or "幻灯片" in text:
+            deliverables.append("PPT报告文档")
+        if "飞书" in text or "feishu" in normalized:
+            deliverables.append("飞书推送")
+
+        return {
+            "goal": text[:120],
+            "hard_constraints": list(dict.fromkeys(constraints)),
+            "deliverables": list(dict.fromkeys(deliverables)),
+            "rerun_required": any(keyword in text for keyword in ("重新", "重做", "重新执行")),
+            "regenerate_required": any(keyword in text for keyword in ("重新生成", "新生成", "重建", "改写")),
+            "resend_required": any(
+                keyword in text for keyword in ("再次推送", "重新推送", "再次发送", "重发", "飞书")
+            ),
+            "must_cover_terms": list(dict.fromkeys(must_cover_terms)),
+        }
+
+    @staticmethod
+    def _merge_planning_understanding(
+        base: dict[str, Any],
+        parsed: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(base or {})
+        goal = str(parsed.get("goal", "") or "").strip()
+        if goal:
+            merged["goal"] = goal
+        for key in ("hard_constraints", "deliverables", "must_cover_terms"):
+            merged[key] = list(
+                dict.fromkeys(
+                    [
+                        str(item).strip()
+                        for item in list(merged.get(key, []) or []) + list(parsed.get(key, []) or [])
+                        if str(item).strip()
+                    ]
+                )
+            )
+        for key in ("rerun_required", "regenerate_required", "resend_required"):
+            merged[key] = bool(merged.get(key)) or bool(parsed.get(key))
+        return merged
+
+    @staticmethod
+    def _find_missing_understanding_constraints(
+        understanding: dict[str, Any],
+        tasks: list[SubTask],
+    ) -> list[str]:
+        if not understanding or not tasks:
+            return []
+        descriptions = [str(task.description or "") for task in tasks]
+        text_blob = "\n".join(descriptions)
+        missing: list[str] = []
+        for term in list(understanding.get("must_cover_terms", []) or []):
+            if term and term not in text_blob:
+                missing.append(term)
+        if understanding.get("rerun_required") and not any(
+            any(keyword in desc for keyword in ("重新", "重做", "替换旧", "纠正", "修正"))
+            for desc in descriptions
+        ):
+            missing.append("重新执行")
+        if understanding.get("resend_required") and not any(
+            any(keyword in desc for keyword in ("再次", "重发", "重新推送", "推送", "发送"))
+            for desc in descriptions
+        ):
+            missing.append("再次交付")
+        if understanding.get("regenerate_required") and not any(
+            any(keyword in desc for keyword in ("重新生成", "新生成", "重建", "生成"))
+            for desc in descriptions
+        ):
+            missing.append("重新生成")
+        return list(dict.fromkeys(missing))
+
+    async def _retry_plan_with_missing_constraints(
+        self,
+        *,
+        task_description: str,
+        context: str,
+        max_sub_tasks: int,
+        system: str,
+        understanding: dict[str, Any],
+        previous_plan: list[SubTask],
+        missing_constraints: list[str],
+    ) -> list[SubTask]:
+        if self._brain is None or not missing_constraints:
+            return []
+        retry_prompt = f"Task: {task_description}\n\n"
+        if context:
+            retry_prompt += f"Context: {context}\n\n"
+        retry_prompt += "Planning understanding:\n"
+        retry_prompt += json.dumps(understanding, ensure_ascii=False, indent=2) + "\n\n"
+        retry_prompt += "Current plan draft:\n"
+        retry_prompt += json.dumps([task.to_dict() for task in previous_plan], ensure_ascii=False, indent=2)
+        retry_prompt += "\n\nMissing constraints that must be explicitly covered in step descriptions:\n"
+        retry_prompt += json.dumps(missing_constraints, ensure_ascii=False) + "\n\n"
+        retry_prompt += (
+            f"Rewrite the plan into at most {max_sub_tasks} sub-tasks. "
+            "At least one step must explicitly mention each missing constraint."
+        )
+        try:
+            response = await self._brain.think(
+                prompt=retry_prompt,
+                system=system,
+                max_tokens=4096,
+                enable_thinking=False,
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+            parsed = self._parse_sub_tasks(content)
+            if not parsed:
+                return []
+            if self._find_missing_understanding_constraints(understanding, parsed):
+                return []
+            logger.info(
+                "[TaskPlanner] Replanned task to cover missing constraints: %s",
+                missing_constraints,
+            )
+            return parsed
+        except Exception as exc:
+            logger.warning("[TaskPlanner] Retry planning with missing constraints failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _enforce_understanding_constraints_on_plan(
+        understanding: dict[str, Any],
+        tasks: list[SubTask],
+    ) -> list[SubTask]:
+        normalized = canonicalize_sub_tasks(tasks or [])
+        if not understanding or not normalized:
+            return normalized
+
+        descriptions = [str(task.description or "") for task in normalized]
+
+        def _find_step_index(*keywords: str) -> int | None:
+            for index, desc in enumerate(descriptions):
+                if any(keyword in desc for keyword in keywords if keyword):
+                    return index
+            return None
+
+        def _append_hint(index: int | None, hint: str) -> None:
+            if index is None or not hint:
+                return
+            desc = str(normalized[index].description or "")
+            if hint in desc:
+                return
+            normalized[index].description = f"{desc}；{hint}"
+            descriptions[index] = normalized[index].description
+
+        search_idx = _find_step_index("搜索", "采集", "新闻", "数据")
+        report_idx = _find_step_index("PPT", "报告", "文档", "生成")
+        deliver_idx = _find_step_index("飞书", "推送", "发送", "交付")
+        if search_idx is None:
+            search_idx = 0
+        if report_idx is None:
+            report_idx = min(len(normalized) - 1, 1 if len(normalized) > 1 else 0)
+        if deliver_idx is None:
+            deliver_idx = len(normalized) - 1
+
+        final_missing = TaskPlanner._find_missing_understanding_constraints(understanding, normalized)
+        if "重新" in final_missing or "重新执行" in final_missing:
+            desc = str(normalized[search_idx].description or "")
+            if "重新" not in desc:
+                normalized[search_idx].description = f"重新{desc}"
+                descriptions[search_idx] = normalized[search_idx].description
+            _append_hint(search_idx, "替换旧数据，不沿用之前错误结果")
+        if understanding.get("regenerate_required"):
+            desc = str(normalized[report_idx].description or "")
+            if "重新生成" not in desc and "重新" not in desc:
+                if "生成" in desc:
+                    normalized[report_idx].description = desc.replace("生成", "重新生成", 1)
+                else:
+                    normalized[report_idx].description = f"重新生成{desc}"
+                descriptions[report_idx] = normalized[report_idx].description
+        if "再次" in final_missing or understanding.get("resend_required"):
+            desc = str(normalized[deliver_idx].description or "")
+            if "再次" not in desc and "重新推送" not in desc and "重发" not in desc:
+                if "推送" in desc:
+                    normalized[deliver_idx].description = desc.replace("推送", "再次推送", 1)
+                elif "发送" in desc:
+                    normalized[deliver_idx].description = desc.replace("发送", "再次发送", 1)
+                else:
+                    normalized[deliver_idx].description = f"再次{desc}"
+                descriptions[deliver_idx] = normalized[deliver_idx].description
+            _append_hint(deliver_idx, "确认推送成功并获取交付回执")
+
+        must_cover_terms = list(understanding.get("must_cover_terms", []) or [])
+        search_terms = [
+            term
+            for term in must_cover_terms
+            if term in {"国内", "中文", "真实", "新闻", "新能源", "乱象", "国内新闻", "中文数据", "行业乱象"}
+        ]
+        if search_terms:
+            _append_hint(search_idx, f"重点覆盖{'、'.join(dict.fromkeys(search_terms))}")
+
+        if understanding.get("hard_constraints"):
+            for constraint in understanding.get("hard_constraints", []):
+                if "真实" in str(constraint) and report_idx is not None:
+                    _append_hint(report_idx, "标注数据来源并保留真实性核验")
+                    break
+
+        return normalized
 
     def _build_rule_based_plan(
         self,
@@ -905,6 +1300,44 @@ class TaskExecutor:
                 tool_filter=sub_task.required_tools or None,
                 progress_event_sink=_progress_event_sink,
             )
+
+            # ── 审查步骤 LLM 重试机制 ──
+            # 若当前是审查子任务且 LLM 未按规范返回 JSON，最多重试 1 次
+            # 强化 LLM 提示，让其仅输出 JSON 代码块
+            from ..tools.handlers.todo_review import (
+                REVIEW_MAX_RETRIES,
+                build_review_retry_message,
+                is_review_step,
+                is_valid_review_json,
+            )
+
+            if is_review_step({"description": sub_task.description}):
+                for retry_idx in range(REVIEW_MAX_RETRIES):
+                    if is_valid_review_json(str(result or "")):
+                        break
+                    logger.warning(
+                        "[TaskExecutor] 审查子任务 %s 第 %d 次响应未含有效 JSON，触发重试",
+                        sub_task.id,
+                        retry_idx + 1,
+                    )
+                    retry_message = build_review_retry_message(sub_task.description)
+                    result = await self.orchestrator.delegate(
+                        session=session,
+                        from_agent=from_agent,
+                        to_agent=sub_task.agent_profile,
+                        message=retry_message,
+                        reason=f"Sub-task {sub_task.id} retry (LLM 未按 JSON 规范返回)",
+                        context="\n".join(context_parts),
+                        tool_filter=sub_task.required_tools or None,
+                        progress_event_sink=_progress_event_sink,
+                    )
+                else:
+                    if not is_valid_review_json(str(result or "")):
+                        logger.warning(
+                            "[TaskExecutor] 审查子任务 %s 重试 %d 次后仍未含有效 JSON，使用 fallback 解析",
+                            sub_task.id,
+                            REVIEW_MAX_RETRIES,
+                        )
 
             sub_task.result = result
             sub_task.status = "completed"

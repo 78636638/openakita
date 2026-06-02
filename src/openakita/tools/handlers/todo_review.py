@@ -1,10 +1,61 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 PASS_MARKERS = ("审查通过", "通过审查", "验收通过", "全部通过", "review passed", "pass")
+
+# 审查步骤重试提示词：当 LLM 未返回有效 JSON 时追加
+# 强化 LLM 输出 JSON 格式的指令，仅在 1 次重试时使用
+REVIEW_RETRY_PROMPT = (
+    "\n\n【重要 - 重新输出 JSON】"
+    "你刚才的回复中未找到符合规范的 JSON 代码块。"
+    "请仅输出严格符合下述格式的 JSON 代码块（不要任何其他说明性文字）：\n"
+    "```json\n"
+    "{\n"
+    '  "review_status": "passed" | "failed" | "needs_follow_up",\n'
+    '  "passed": true | false,\n'
+    '  "blockers": [],\n'
+    '  "delivery_verified": true | false,\n'
+    '  "test_verified": true | false,\n'
+    '  "hallucination_found": true | false,\n'
+    '  "deliverables": [],\n'
+    '  "missing_deliverables": [],\n'
+    '  "summary": "一句话结论"\n'
+    "}\n"
+    "```\n"
+    "系统将严格按 review_status 字段判定审查结果。"
+)
+
+# 审查步骤最大重试次数（避免无限重试）
+REVIEW_MAX_RETRIES = 1
+
+
+def is_valid_review_json(text: str) -> bool:
+    """
+    判断文本中是否包含有效的审查 JSON（含 review_status 字段）。
+
+    用于审查步骤的 LLM 重试机制：若 LLM 未按规范返回 JSON，则触发重试。
+    """
+    payload = _extract_json_payload(text)
+    if not isinstance(payload, dict):
+        return False
+    if "review_status" not in payload:
+        return False
+    status = str(payload.get("review_status", "")).strip().lower()
+    return status in ("passed", "failed", "needs_follow_up")
+
+
+def build_review_retry_message(original_message: str) -> str:
+    """
+    构造重试时发送给 LLM 的消息：
+    在原任务描述后追加 REVIEW_RETRY_PROMPT，强化 JSON 输出要求。
+    """
+    return original_message + REVIEW_RETRY_PROMPT
 FAIL_MARKERS = (
     "未通过",
     "不通过",
@@ -161,7 +212,8 @@ def _normalize_review_summary(
 
     summary = {
         "verdict": _normalize_verdict(
-            payload.get("verdict")
+            payload.get("review_status")
+            or payload.get("verdict")
             or payload.get("status")
             or payload.get("result")
             or payload.get("decision")
@@ -237,6 +289,13 @@ def _normalize_review_summary(
         summary["passed"] = summary["verdict"] == "passed"
     if summary["verdict"] == "unknown" and summary["passed"]:
         summary["verdict"] = "passed"
+    # 安全网：若 verdict 是 failed/needs_follow_up，强制 passed 为 False
+    if summary["verdict"] in ("failed", "needs_follow_up") and summary["passed"] is True:
+        summary["passed"] = False
+        logger.debug(
+            "[TodoReview] verdict=%s 与 passed=true 矛盾，强制 passed=False",
+            summary["verdict"],
+        )
     if summary["hallucination_found"] is True:
         summary["verdict"] = "failed"
         summary["passed"] = False

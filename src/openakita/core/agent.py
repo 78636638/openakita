@@ -1560,6 +1560,7 @@ class Agent:
 
         # Handler Registry（模块化工具执行）
         self.handler_registry = SystemHandlerRegistry()
+        self._register_local_tools_cache_invalidation_hook()
         self._init_handlers()
         self._core_tool_names: set[str] = set(self.handler_registry.list_tools())
 
@@ -2236,6 +2237,8 @@ class Agent:
                 self._memory_handler.reset_guide()
             # 重建 system prompt（用共享的 catalog 引用）
             self._context.system = self._build_system_prompt()
+            with contextlib.suppress(Exception):
+                self._prewarm_current_brain_tools_cache()
             self._initialized = True
             logger.info(
                 "Agent '%s' initialized via share_from='%s' "
@@ -2311,25 +2314,7 @@ class Agent:
             self._initialized = True
             return
 
-        # === 启动预热（把昂贵但可复用的初始化提前到启动阶段）===
-        # 目标：避免首条用户消息才加载 embedding/向量库、生成清单等，导致 IM 首响应显著变慢。
-        try:
-            # 1) 预热清单缓存（避免每次 build_system_prompt 都重新生成）
-            # 注意：这些方法内部已有缓存；这里调用一次确保缓存命中。
-            with contextlib.suppress(Exception):
-                self.tool_catalog.get_catalog()
-            with contextlib.suppress(Exception):
-                self.skill_catalog.get_catalog()
-            with contextlib.suppress(Exception):
-                self.mcp_catalog.get_catalog()
-
-            # 2) 预热向量库（embedding 模型 + ChromaDB）
-            # 放到线程中执行，避免阻塞事件循环；初始化完成后后续搜索会明显更快。
-            if self.memory_manager.vector_store is not None:
-                await asyncio.to_thread(lambda: bool(self.memory_manager.vector_store.enabled))
-        except Exception as e:
-            # 预热失败不应影响启动（例如 chromadb 未安装时会自动禁用）
-            logger.debug(f"[Prewarm] skipped/failed: {e}")
+        await self._prewarm_startup_resources()
 
         # === 表情包引擎初始化 ===
         if self.sticker_engine:
@@ -2400,6 +2385,41 @@ class Agent:
                 "[share_from] registered '%s' as the process primary agent.",
                 self.name,
             )
+
+    async def _prewarm_startup_resources(self) -> None:
+        """Prewarm startup caches without affecting agent initialization on failure."""
+        # 目标：避免首条用户消息才加载 catalog / tools / embedding，减少冷启动抖动。
+        for label, action in (
+            ("tool catalog", lambda: self.tool_catalog.get_catalog()),
+            ("skill catalog", lambda: self.skill_catalog.get_catalog()),
+            ("mcp catalog", lambda: self.mcp_catalog.get_catalog()),
+            ("brain tools cache", self._prewarm_current_brain_tools_cache),
+        ):
+            try:
+                action()
+            except Exception as exc:
+                logger.debug("[Prewarm] %s skipped/failed: %s", label, exc)
+
+        vector_store = getattr(self.memory_manager, "vector_store", None)
+        if vector_store is None:
+            return
+
+        try:
+            # 在线程中触发 embedding / vector backend 初始化，避免阻塞事件循环。
+            await asyncio.to_thread(lambda: bool(vector_store.enabled))
+        except Exception as exc:
+            logger.debug("[Prewarm] vector store skipped/failed: %s", exc)
+
+    def _prewarm_current_brain_tools_cache(self) -> None:
+        """Prewarm Brain tool conversion cache for the current effective toolset."""
+        self.brain.prewarm_tools_cache(self._effective_tools)
+
+    def _register_local_tools_cache_invalidation_hook(self) -> None:
+        """Ensure this agent's handler registry invalidates its own Brain cache."""
+        try:
+            self.handler_registry.register_invalidation_callback(self.brain.clear_tools_cache)
+        except Exception as exc:
+            logger.debug("[Agent] local tools cache invalidation hook skipped/failed: %s", exc)
 
     def _attach_shared_runtime(self, parent: "Agent") -> None:
         """让 sub-agent 直接复用主 Agent 已经初始化好的注册表/客户端/目录。
@@ -9069,6 +9089,7 @@ class Agent:
 
     @staticmethod
     def _build_required_todo_bootstrap_steps(message: str) -> list[dict[str, str]]:
+        """保留旧实现以维持向后兼容。新代码应使用 _build_intelligent_todo_steps。"""
         summary = " ".join(str(message or "").strip().split())
         if len(summary) > 120:
             summary = summary[:117].rstrip() + "..."
@@ -9080,11 +9101,316 @@ class Agent:
             {
                 "id": "step_4",
                 "description": (
-                    "审查：默认质疑前序步骤均未真正完成，核验结果、交付物、需求匹配与测试证据；"
-                    "未通过则继续下一轮 Todo。"
+                    "审查：核验当前任务执行结果（仅检查执行日志，不重跑工具），"
+                    "确认完成状态、交付物齐全、用户需求匹配；未通过则继续下一轮 Todo。\n\n"
+                    "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
+                    "```json\n"
+                    "{\n"
+                    '  "review_status": "passed" | "failed" | "needs_follow_up",\n'
+                    '  "passed": true | false,\n'
+                    '  "blockers": [],\n'
+                    '  "delivery_verified": true | false,\n'
+                    '  "test_verified": true | false,\n'
+                    '  "hallucination_found": true | false,\n'
+                    '  "deliverables": [],\n'
+                    '  "missing_deliverables": [],\n'
+                    '  "summary": "一句话结论"\n'
+                    "}\n"
+                    "```\n"
+                    "系统将基于 review_status 直接判定审查结果，无需额外说明。"
                 ),
             },
         ]
+
+    async def _build_intelligent_todo_steps(
+        self,
+        message: str,
+        intent_result: Any | None = None,
+    ) -> list[dict[str, str]]:
+        """
+        根据用户消息和意图分析结果，生成智能化的 Todo 步骤。
+
+        策略：
+        1. 多步任务（multi_step 或 score >= 1）：调用 TaskPlanner 进行 LLM 拆解
+        2. 简单任务（score == 0）：使用消息内容生成最少步骤
+
+        Returns:
+            list of step dicts with 'id' and 'description'
+        """
+        summary = " ".join(str(message or "").strip().split())
+        if len(summary) > 120:
+            summary = summary[:117].rstrip() + "..."
+        task_line = summary or "执行当前用户请求"
+
+        complexity_score = 0
+        multi_step = False
+        if intent_result and getattr(intent_result, "complexity", None):
+            complexity = intent_result.complexity
+            complexity_score = int(getattr(complexity, "score", 0) or 0)
+            multi_step = bool(getattr(complexity, "multi_step_required", False))
+
+        # #region debug-point A:todo-build-entry
+        import json as _debug_json, urllib.request as _debug_urlrequest
+        _debug_u, _debug_s = "http://127.0.0.1:7777/event", "todo-plan-quality"
+        try:
+            with open(".dbg/todo-plan-quality.env", encoding="utf-8") as _debug_f:
+                _debug_c = _debug_f.read()
+            _debug_u = next(
+                (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SERVER_URL=")),
+                _debug_u,
+            )
+            _debug_s = next(
+                (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SESSION_ID=")),
+                _debug_s,
+            )
+        except Exception:
+            pass
+        try:
+            _debug_payload = {
+                "sessionId": _debug_s,
+                "runId": "pre-fix",
+                "hypothesisId": "A",
+                "location": "openakita.core.agent:_build_intelligent_todo_steps",
+                "msg": "[DEBUG] todo intelligent decomposition entry",
+                "data": {
+                    "message": str(message or "")[:500],
+                    "message_len": len(str(message or "")),
+                    "complexity_score": complexity_score,
+                    "multi_step": multi_step,
+                    "intent_task_type": str(getattr(intent_result, "task_type", "") or ""),
+                    "intent_tool_hints": list(getattr(intent_result, "tool_hints", []) or []),
+                    "intent_memory_keywords": list(getattr(intent_result, "memory_keywords", []) or []),
+                },
+            }
+            _debug_req = _debug_urlrequest.Request(
+                _debug_u,
+                data=_debug_json.dumps(_debug_payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+        except Exception:
+            pass
+        # #endregion
+
+        if (multi_step or complexity_score >= 1) and getattr(self, "brain", None) is not None:
+            try:
+                from .task_planner import TaskPlanner
+
+                planner = TaskPlanner(self.brain)
+                sub_tasks = await asyncio.wait_for(
+                    planner.plan(
+                        task_description=message,
+                        max_sub_tasks=5,
+                    ),
+                    timeout=30.0,
+                )
+                if sub_tasks:
+                    # #region debug-point D:todo-build-llm-success
+                    try:
+                        _debug_payload = {
+                            "sessionId": _debug_s,
+                            "runId": "pre-fix",
+                            "hypothesisId": "D",
+                            "location": "openakita.core.agent:_build_intelligent_todo_steps",
+                            "msg": "[DEBUG] todo intelligent decomposition used llm planner",
+                            "data": {
+                                "message": str(message or "")[:500],
+                                "step_count": len(sub_tasks),
+                                "steps": [
+                                    {
+                                        "id": str(st.id),
+                                        "description": str(st.description)[:240],
+                                    }
+                                    for st in sub_tasks[:8]
+                                ],
+                            },
+                        }
+                        _debug_req = _debug_urlrequest.Request(
+                            _debug_u,
+                            data=_debug_json.dumps(_debug_payload).encode(),
+                            headers={"Content-Type": "application/json"},
+                        )
+                        _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+                    except Exception:
+                        pass
+                    # #endregion
+                    logger.info(
+                        f"[Todo] LLM decomposition produced {len(sub_tasks)} sub-tasks"
+                    )
+                    return [
+                        {
+                            "id": str(st.id),
+                            "description": str(st.description)[:200],
+                        }
+                        for st in sub_tasks
+                    ]
+            except TimeoutError:
+                logger.warning("[Todo] LLM decomposition timed out, using smart default")
+            except Exception as e:
+                logger.warning(
+                    f"[Todo] LLM decomposition failed: {e}, using smart default"
+                )
+
+        task_brief = task_line if len(task_line) <= 30 else task_line[:27].rstrip() + "..."
+        if multi_step or complexity_score >= 1:
+            fallback_steps = self._build_constraint_aware_todo_fallback_steps(
+                message=message,
+                task_brief=task_brief,
+            )
+            # #region debug-point C:todo-build-fallback
+            try:
+                _debug_payload = {
+                    "sessionId": _debug_s,
+                    "runId": "pre-fix",
+                    "hypothesisId": "C",
+                    "location": "openakita.core.agent:_build_intelligent_todo_steps",
+                    "msg": "[DEBUG] todo intelligent decomposition fell back to smart default",
+                    "data": {
+                        "message": str(message or "")[:500],
+                        "complexity_score": complexity_score,
+                        "multi_step": multi_step,
+                        "task_brief": task_brief,
+                        "fallback_steps": fallback_steps,
+                    },
+                }
+                _debug_req = _debug_urlrequest.Request(
+                    _debug_u,
+                    data=_debug_json.dumps(_debug_payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+            except Exception:
+                pass
+            # #endregion
+            return fallback_steps
+        return [
+            {"id": "step_1", "description": f"处理用户请求：{task_brief}"},
+            {"id": "step_2", "description": "整理结果并回复用户"},
+        ]
+
+    @staticmethod
+    def _build_constraint_aware_todo_fallback_steps(
+        *,
+        message: str,
+        task_brief: str,
+    ) -> list[dict[str, str]]:
+        from .task_planner import TaskPlanner
+
+        understanding = TaskPlanner._build_rule_based_understanding(message)
+        normalized = str(message or "")
+        need_news = any(keyword in normalized for keyword in ("新闻", "采集", "调研", "数据"))
+        need_report = any(keyword in normalized.lower() for keyword in ("ppt",)) or any(
+            keyword in normalized for keyword in ("报告", "文档", "幻灯片")
+        )
+        need_delivery = any(keyword in normalized for keyword in ("飞书", "推送", "发送"))
+        rerun_required = bool(understanding.get("rerun_required"))
+        regenerate_required = bool(understanding.get("regenerate_required"))
+        resend_required = bool(understanding.get("resend_required"))
+
+        search_prefix = "重新" if rerun_required else ""
+        report_prefix = "重新" if regenerate_required or rerun_required else ""
+        delivery_prefix = "再次" if resend_required else ""
+
+        search_scope = []
+        for token in ("国内", "中文", "真实", "新闻", "新能源", "乱象"):
+            if token in normalized:
+                search_scope.append(token)
+        search_hint = "".join(dict.fromkeys(search_scope)) or task_brief
+        steps: list[dict[str, str]] = []
+
+        if need_news:
+            steps.append(
+                {
+                    "id": "step_1",
+                    "description": (
+                        f"{search_prefix}搜索并采集{search_hint}相关数据"
+                        "，优先可信来源，并明确标注时间、出处与真实性结论"
+                    ),
+                }
+            )
+            steps.append(
+                {
+                    "id": "step_2",
+                    "description": (
+                        f"整理并核实{search_prefix or ''}采集到的数据"
+                        "，筛除不实或过时信息，保留可用于交付的真实案例与来源"
+                    ),
+                }
+            )
+        else:
+            steps.append({"id": "step_1", "description": f"{search_prefix}处理用户请求：{task_brief}"})
+
+        next_id = len(steps) + 1
+        if need_report:
+            steps.append(
+                {
+                    "id": f"step_{next_id}",
+                    "description": (
+                        f"{report_prefix}生成交付物"
+                        if not need_news
+                        else f"{report_prefix}生成PPT/报告文档，基于核实后的真实数据完成最终交付内容"
+                    ),
+                }
+            )
+            next_id += 1
+        if need_delivery:
+            steps.append(
+                {
+                    "id": f"step_{next_id}",
+                    "description": (
+                        f"{delivery_prefix}推送交付物到飞书，并确认发送成功与交付回执"
+                    ),
+                }
+            )
+            next_id += 1
+        steps.append(
+            {
+                "id": f"step_{next_id}",
+                "description": (
+                    "审查当前任务交付物质量，核验结果与用户需求匹配（仅检查执行日志，不重跑工具）；"
+                    "涉及代码时确认已完成专业功能测试。\n\n"
+                    "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
+                    "```json\n"
+                    "{\n"
+                    '  "review_status": "passed" | "failed" | "needs_follow_up",\n'
+                    '  "passed": true | false,\n'
+                    '  "blockers": [],\n'
+                    '  "delivery_verified": true | false,\n'
+                    '  "test_verified": true | false,\n'
+                    '  "hallucination_found": true | false,\n'
+                    '  "deliverables": [],\n'
+                    '  "missing_deliverables": [],\n'
+                    '  "summary": "一句话结论"\n'
+                    "}\n"
+                    "```\n"
+                    "系统将基于 review_status 直接判定审查结果。"
+                ),
+            }
+        )
+        return steps
+
+    @staticmethod
+    def _is_hardcoded_todo_plan(plan: dict | None) -> bool:
+        """检查计划是否使用了硬编码的步骤模板。"""
+        if not isinstance(plan, dict):
+            return False
+        steps = plan.get("steps", []) or []
+        if not steps:
+            return False
+        hardcoded_markers = (
+            "分析任务目标并确认执行路径",
+            "审查：核验当前任务执行结果（仅检查执行日志，不重跑工具）",
+            "分析任务目标：",
+            "制定执行计划并准备所需资源",
+            "审查当前任务交付物质量，核验结果与用户需求匹配",
+        )
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            desc = str(step.get("description", "") or "")
+            if any(marker in desc for marker in hardcoded_markers):
+                return True
+        return False
 
     @staticmethod
     def _looks_like_review_sub_task(task: SubTask | dict[str, Any]) -> bool:
@@ -9110,8 +9436,24 @@ class Agent:
         review_task = SubTask(
             id=f"step_{len(normalized) + 1}",
             description=(
-                "审查：默认质疑前序任务均未真正完成，逐项核验完成状态、交付物、用户需求匹配、"
-                "是否存在幻觉或说谎式完成；涉及代码时确认已完成专业功能测试。"
+                "审查：核验当前任务执行结果（仅检查执行日志，不重跑工具），"
+                "确认完成状态、交付物齐全、用户需求匹配、是否存在幻觉或说谎式完成；"
+                "涉及代码时确认已完成专业功能测试。\n\n"
+                "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
+                "```json\n"
+                "{\n"
+                '  "review_status": "passed" | "failed" | "needs_follow_up",\n'
+                '  "passed": true | false,\n'
+                '  "blockers": [],\n'
+                '  "delivery_verified": true | false,\n'
+                '  "test_verified": true | false,\n'
+                '  "hallucination_found": true | false,\n'
+                '  "deliverables": [],\n'
+                '  "missing_deliverables": [],\n'
+                '  "summary": "一句话结论"\n'
+                "}\n"
+                "```\n"
+                "系统将基于 review_status 直接判定审查结果。"
             ),
             required_tools=[],
             agent_profile="code" if any("code" in str(task.agent_profile) for task in normalized) else "default",
@@ -9148,13 +9490,75 @@ class Agent:
         plan = handler.get_plan_for(session_id) if handler else None
         restored = plan is not None
 
+        if plan and self._is_hardcoded_todo_plan(plan):
+            logger.info(
+                "[Todo] Detected hardcoded plan for session %s, regenerating with intelligent decomposition",
+                session_id,
+            )
+            # #region debug-point C:todo-hardcoded-regenerate
+            import json as _debug_json, urllib.request as _debug_urlrequest
+            _debug_u, _debug_s = "http://127.0.0.1:7777/event", "todo-plan-quality"
+            try:
+                with open(".dbg/todo-plan-quality.env", encoding="utf-8") as _debug_f:
+                    _debug_c = _debug_f.read()
+                _debug_u = next(
+                    (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SERVER_URL=")),
+                    _debug_u,
+                )
+                _debug_s = next(
+                    (_line.split("=", 1)[1] for _line in _debug_c.splitlines() if _line.startswith("DEBUG_SESSION_ID=")),
+                    _debug_s,
+                )
+            except Exception:
+                pass
+            try:
+                _debug_payload = {
+                    "sessionId": _debug_s,
+                    "runId": "pre-fix",
+                    "hypothesisId": "C",
+                    "location": "openakita.core.agent:_ensure_required_todo_visible",
+                    "msg": "[DEBUG] hardcoded todo regenerated with intelligent decomposition",
+                    "data": {
+                        "session_id": session_id,
+                        "message": str(message or "")[:500],
+                        "existing_step_count": len((plan or {}).get("steps", []) or []),
+                        "existing_steps": [
+                            str(step.get("description", "") or "")[:200]
+                            for step in ((plan or {}).get("steps", []) or [])[:8]
+                            if isinstance(step, dict)
+                        ],
+                    },
+                }
+                _debug_req = _debug_urlrequest.Request(
+                    _debug_u,
+                    data=_debug_json.dumps(_debug_payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                _debug_urlrequest.urlopen(_debug_req, timeout=1).read()
+            except Exception:
+                pass
+            # #endregion
+            try:
+                from ..tools.handlers.plan import cancel_todo
+
+                cancel_todo(session_id)
+            except Exception as exc:
+                logger.warning("[Todo] Failed to cancel hardcoded plan: %s", exc)
+            plan = None
+            restored = False
+            handler = get_todo_handler_for_session(session_id)
+            if handler:
+                plan = handler.get_plan_for(session_id)
+
         if plan is None and not has_active_todo(session_id):
             try:
+                intent_result = getattr(self, "_current_intent", None)
+                steps = await self._build_intelligent_todo_steps(message, intent_result)
                 await self.handler_registry.execute_by_tool(
                     "create_todo",
                     {
                         "task_summary": str(message or "")[:200],
-                        "steps": self._build_required_todo_bootstrap_steps(message),
+                        "steps": steps,
                     },
                 )
             except Exception as exc:
@@ -9325,17 +9729,20 @@ class Agent:
         step_summaries: list[dict[str, Any]] = []
         for task in sub_tasks:
             result_text = str(results.get(task.id, task.result or "") or "").strip()
-            step_summaries.append(
-                {
-                    "id": task.id,
-                    "description": task.description,
-                    "status": task.status,
-                    "agent_profile": task.agent_profile,
-                    "depends_on": list(task.depends_on),
-                    "required_tools": list(task.required_tools),
-                    "result_preview": result_text[:300],
-                }
-            )
+            step_summary = {
+                "id": task.id,
+                "description": task.description,
+                "status": task.status,
+                "agent_profile": task.agent_profile,
+                "depends_on": list(task.depends_on),
+                "required_tools": list(task.required_tools),
+                "result_preview": result_text[:300],
+            }
+            if self._looks_like_review_sub_task(task):
+                review_result_json = self._extract_review_result_json(result_text)
+                if review_result_json:
+                    step_summary["review_result_json"] = review_result_json
+            step_summaries.append(step_summary)
 
         record = {
             "orchestration_id": uuid.uuid4().hex[:12],
@@ -9390,6 +9797,10 @@ class Agent:
                     "planning_feedback_summary": dict(record.get("planning_feedback_summary", {}) or {}),
                     "work_summary": record["work_summary"],
                 },
+            )
+            session.set_metadata(
+                "last_task_verification_summary",
+                dict(record.get("verification_summary", {}) or {}),
             )
             session.set_metadata("_pending_orchestration_verification_id", record["orchestration_id"])
         except Exception as exc:
@@ -9515,6 +9926,122 @@ class Agent:
             return ast.literal_eval(preview)
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_delivery_state_from_receipt(receipt: dict[str, Any]) -> str:
+        state = str(receipt.get("delivery_state") or "").strip().lower()
+        if state:
+            return state if state in {"delivered", "local_only", "failed"} else "failed"
+        receipt_status = str(receipt.get("status") or "").strip().lower()
+        if receipt_status in {"failed", "error"}:
+            return "failed"
+        if receipt_status == "delivered" and receipt.get("channel") == "desktop":
+            return "local_only"
+        if receipt_status in {"delivered", "skipped", "relayed", "submitted"}:
+            return "delivered"
+        return "failed"
+
+    @classmethod
+    def _build_task_plan_tool_metadata_summary(cls, steps: list[dict[str, Any]]) -> dict[str, Any]:
+        tool_names: list[str] = []
+        delivery_tools: list[str] = []
+        error_tool_count = 0
+        tool_result_count = 0
+        delivery_receipt_count = 0
+        delivery_state_counts = {"delivered": 0, "local_only": 0, "failed": 0}
+        has_delivery_metadata = False
+
+        def _remember(items: list[str], value: str) -> None:
+            normalized = str(value or "").strip()
+            if normalized and normalized not in items:
+                items.append(normalized)
+
+        def _merge_delivery_summary(summary: dict[str, Any]) -> None:
+            nonlocal has_delivery_metadata
+            has_delivery_metadata = True
+            for key in ("delivered", "local_only", "failed"):
+                try:
+                    delivery_state_counts[key] += int(summary.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        for step in (steps or []):
+            if not isinstance(step, dict):
+                continue
+            required_tools = [
+                str(tool).strip()
+                for tool in (step.get("required_tools", []) or [])
+                if str(tool).strip()
+            ]
+            if required_tools:
+                tool_result_count += 1
+                if str(step.get("status", "") or "").strip() == "failed":
+                    error_tool_count += 1
+            for tool_name in required_tools:
+                _remember(tool_names, tool_name)
+
+            payload = cls._parse_step_result_payload(str(step.get("result_preview", "") or ""))
+            if not isinstance(payload, dict):
+                continue
+
+            has_summary = False
+            for key in ("delivery_state_summary", "_delivery_state_summary"):
+                summary = payload.get(key)
+                if isinstance(summary, dict):
+                    _merge_delivery_summary(summary)
+                    has_summary = True
+
+            receipts = payload.get("receipts") or payload.get("_delivery_receipts")
+            if isinstance(receipts, list):
+                valid_receipts = [item for item in receipts if isinstance(item, dict)]
+                if valid_receipts:
+                    has_delivery_metadata = True
+                    delivery_receipt_count += len(valid_receipts)
+                    for tool_name in required_tools:
+                        _remember(delivery_tools, tool_name)
+                    if not has_summary:
+                        for receipt in valid_receipts:
+                            delivery_state_counts[cls._normalize_delivery_state_from_receipt(receipt)] += 1
+
+            if has_summary and required_tools:
+                for tool_name in required_tools:
+                    _remember(delivery_tools, tool_name)
+
+            if not has_summary and not isinstance(receipts, list):
+                delivery_state = str(payload.get("delivery_state", "") or "").strip().lower()
+                if delivery_state in delivery_state_counts:
+                    has_delivery_metadata = True
+                    delivery_state_counts[delivery_state] += 1
+                    for tool_name in required_tools:
+                        _remember(delivery_tools, tool_name)
+
+        return {
+            "tool_result_count": tool_result_count,
+            "tool_names": tool_names[:12],
+            "error_tool_count": error_tool_count,
+            "has_delivery_metadata": has_delivery_metadata,
+            "delivery_tools": delivery_tools[:8],
+            "delivery_receipt_count": delivery_receipt_count,
+            "delivery_state_counts": delivery_state_counts,
+        }
+
+    @staticmethod
+    def _extract_review_result_json(result_text: str) -> str:
+        text = str(result_text or "").strip()
+        if not text:
+            return ""
+        try:
+            from ..tools.handlers.todo_review import _extract_json_payload
+
+            payload = _extract_json_payload(text)
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return ""
+        try:
+            return json.dumps(payload, ensure_ascii=False)[:4000]
+        except Exception:
+            return ""
 
     @classmethod
     def _extract_delivery_state_counts(cls, record: dict[str, Any]) -> dict[str, int]:
@@ -9699,11 +10226,17 @@ class Agent:
             ]
         ).lower()
         code_task_detected = any(keyword in task_and_steps for keyword in code_keywords)
+        review_result_source = str(
+            latest_review_step.get("review_result_json")
+            or latest_review_step.get("result_preview", "")
+            or ""
+        )
         review_summary = parse_review_result(
-            str(latest_review_step.get("result_preview", "") or ""),
+            review_result_source,
             requires_code_test=code_task_detected,
             requires_delivery=requires_delivery_evidence,
         )
+        tool_metadata_summary = Agent._build_task_plan_tool_metadata_summary(steps)
         review_passed = bool(review_summary.get("passed"))
         strong_test_keywords = (
             "pytest",
@@ -9864,6 +10397,7 @@ class Agent:
             "has_test_evidence": has_test_evidence,
             "delivery_verified": delivery_verified,
             "missing_deliverables": missing_deliverables,
+            "tool_metadata_summary": tool_metadata_summary,
             "suggested_next_round_todo": suggested_next_round_todo,
         }
 
