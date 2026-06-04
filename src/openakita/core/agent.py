@@ -2388,8 +2388,10 @@ class Agent:
             logger.debug(f"[Persona] trait loading skipped: {e}")
 
         # --- Todo 状态恢复 + 防抖保存循环 ---
+        # 注意：datetime 已由模块顶部 from datetime import datetime 导入，
+        # 不要再在函数体内重复 `from datetime import datetime`，
+        # 否则会触发 UnboundLocalError（局部变量遮蔽了模块级名字）。
         try:
-            from datetime import datetime
             from ..tools.handlers.plan import register_active_todo, register_plan_handler
 
             plan_handle_fn = self.handler_registry.get_handler("plan")
@@ -9576,6 +9578,8 @@ class Agent:
                 "description": (
                     "审查：核验当前任务执行结果（仅检查执行日志，不重跑工具），"
                     "确认完成状态、交付物齐全、用户需求匹配；未通过则继续下一轮 Todo。\n\n"
+                    "【强制】请仅以下述 JSON 代码块作为审查结论的**唯一**输出形式。\n"
+                    "即使你无法审查，也必须按 failed / unknown 输出 JSON 描述原因，**禁止**只用自然语言文字给出结论。\n\n"
                     "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
                     "```json\n"
                     "{\n"
@@ -9591,7 +9595,9 @@ class Agent:
                     "```\n"
                     "**强制要求**：若涉及 IM 推送（飞书/Telegram/邮件），必须在 message_id 字段中填入**真实的** message_id（格式如 om_xxxxxxxx）。\n"
                     "**若执行日志中无 message_id**，必须判定 review_status=failed 且 delivery_verified=false，否则视为幻觉。\n"
-                    "系统将基于 review_status 直接判定审查结果，并会自动反查日志验证 message_id 真实性。"
+                    "系统将基于 review_status 直接判定审查结果，并会自动反查日志验证 message_id 真实性。\n"
+                    "⚠️ 若未按上述格式输出 JSON，parse_review_result 将判定 verdict=unknown / passed=None，\n"
+                    "系统会立即生成下一轮 Todo（step_1 描述前缀为 [重做审查]），请直接补齐 JSON 而非改写自然语言。"
                 ),
             },
         ]
@@ -9843,6 +9849,8 @@ class Agent:
                 "description": (
                     "审查当前任务交付物质量，核验结果与用户需求匹配（仅检查执行日志，不重跑工具）；"
                     "涉及代码时确认已完成专业功能测试。\n\n"
+                    "【强制】请仅以下述 JSON 代码块作为审查结论的**唯一**输出形式。\n"
+                    "即使你无法审查，也必须按 failed / unknown 输出 JSON 描述原因，**禁止**只用自然语言文字给出结论。\n\n"
                     "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
                     "```json\n"
                     "{\n"
@@ -9861,6 +9869,8 @@ class Agent:
                     "```\n"
                     "**强制要求**：若涉及 IM 推送（飞书/Telegram/邮件），必须在 message_id 字段中填入**真实的** message_id（格式如 om_xxxxxxxx）。\n"
                     "**若执行日志中无 message_id**，必须判定 review_status=failed 且 delivery_verified=false，否则视为幻觉。\n"
+                    "⚠️ 若未按上述格式输出 JSON，parse_review_result 将判定 verdict=unknown / passed=None，\n"
+                    "系统会立即生成下一轮 Todo（step_1 描述前缀为 [重做审查]），请直接补齐 JSON 而非改写自然语言。\n"
                     "系统将基于 review_status 直接判定审查结果，并会自动反查日志验证 message_id 真实性。"
                 ),
             }
@@ -9917,6 +9927,8 @@ class Agent:
                 "审查：核验当前任务执行结果（仅检查执行日志，不重跑工具），"
                 "确认完成状态、交付物齐全、用户需求匹配、是否存在幻觉或说谎式完成；"
                 "涉及代码时确认已完成专业功能测试。\n\n"
+                "【强制】请仅以下述 JSON 代码块作为审查结论的**唯一**输出形式。\n"
+                "即使你无法审查，也必须按 failed / unknown 输出 JSON 描述原因，**禁止**只用自然语言文字给出结论。\n\n"
                 "【输出规范】请在回复末尾严格输出如下 JSON 代码块（仅一个）：\n"
                 "```json\n"
                 "{\n"
@@ -9935,7 +9947,9 @@ class Agent:
                 "```\n"
                 "**强制要求**：若涉及 IM 推送（飞书/Telegram/邮件），必须在 message_id 字段中填入**真实的** message_id（格式如 om_xxxxxxxx）。\n"
                 "**若执行日志中无 message_id**，必须判定 review_status=failed 且 delivery_verified=false，否则视为幻觉。\n"
-                "系统将基于 review_status 直接判定审查结果，并会自动反查日志验证 message_id 真实性。"
+                "系统将基于 review_status 直接判定审查结果，并会自动反查日志验证 message_id 真实性。\n"
+                "⚠️ 若未按上述格式输出 JSON，parse_review_result 将判定 verdict=unknown / passed=None，\n"
+                "系统会立即生成下一轮 Todo（step_1 描述前缀为 [重做审查]），请直接补齐 JSON 而非改写自然语言。"
             ),
             required_tools=[],
             agent_profile="code" if any("code" in str(task.agent_profile) for task in normalized) else "default",
@@ -10991,9 +11005,16 @@ class Agent:
         elif not review_completed:
             summary_status = "incomplete"
             reason = "最终审查尚未完成"
+        elif review_passed is None:
+            # 2026-06 P0-Bug-A 修复：LLM 未返回结构化 JSON 时，parse_review_result
+            # 返回 verdict="unknown" / passed=None（不再用字符串兜底伪造 verdict）。
+            # 这里显式走"未生成有效结论"分支，并交由 build_next_round_todo
+            # 生成下一轮 Todo 让 LLM 重新以 JSON 格式输出。
+            summary_status = "incomplete"
+            reason = "审查未生成结构化 JSON 结论（LLM 输出自然语言审查文本）"
         elif not review_passed:
             summary_status = "incomplete"
-            reason = "最终审查未明确通过"
+            reason = "最终审查未通过"
         elif requires_delivery_evidence and delivery_verified is False:
             summary_status = "incomplete"
             reason = "最终审查确认交付未核验通过"

@@ -44,7 +44,9 @@ _TARGET_NOT_EXIST_MARKERS = (
 _GENERIC_FAIL_MARKERS = (
     "[失败]",
     "[org_delegate_task 失败]",
-    "❌",
+    # 2026-06 L4 收窄：去掉 "❌" emoji。它在很多工具的"友好失败提示"里
+    # 都会出现（如 "已检查项：❌ 文件不存在 / ✅ 配置正确"），与 is_error 标志
+    # 无关。真实失败应走 is_error=True 主路径或本表里的"结构化"标记。
     "⚠️ 工具执行错误",
     "⚠️ 策略拒绝",
     "错误类型:",

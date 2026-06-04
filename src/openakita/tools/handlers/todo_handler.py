@@ -23,10 +23,10 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.policy_v2 import ApprovalClass
 from .todo_review import (
-    FAIL_MARKERS,
-    PASS_MARKERS,
+    REVIEW_MAX_RETRIES,
     build_next_round_todo,
     is_review_step,
+    is_valid_review_json,
     parse_review_result,
     summarize_review_summary,
 )
@@ -128,14 +128,6 @@ class PlanHandler:
     @staticmethod
     def _is_review_step(step: dict[str, Any]) -> bool:
         return is_review_step(step)
-
-    @staticmethod
-    def _review_pass_markers() -> tuple[str, ...]:
-        return PASS_MARKERS
-
-    @staticmethod
-    def _review_fail_markers() -> tuple[str, ...]:
-        return FAIL_MARKERS
 
     @classmethod
     def _parse_review_summary(cls, step: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
@@ -265,17 +257,19 @@ class PlanHandler:
 
     @classmethod
     def _review_step_passed(cls, step: dict[str, Any]) -> bool:
+        """检查审查步骤是否明确通过。
+
+        2026-06 P0-Bug-A 修复：不再做 "审查通过" / "审查失败" 等子串匹配兜底。
+        只信任 parse_review_result 写进 step["review_summary"] 的结构化字段。
+        返回值语义：
+          - True: summary.passed == True（LLM 显式给出 review_status="passed"）
+          - False: 其它所有情况（LLM 给出 failed / 没收结构化 JSON / 字段缺失）
+                  区分"显式失败"和"未生成结论"需要看 summary.verdict。
+        """
         summary = step.get("review_summary")
         if not isinstance(summary, dict):
             return False
-        if summary.get("passed") is True:
-            return True
-        result = str(summary.get("raw_result", "") or "").strip().lower()
-        if not result:
-            return False
-        if any(marker.lower() in result for marker in cls._review_fail_markers()):
-            return False
-        return any(marker.lower() in result for marker in cls._review_pass_markers())
+        return summary.get("passed") is True
 
     @staticmethod
     def _step_has_meaningful_result(step: dict[str, Any]) -> bool:
@@ -381,7 +375,14 @@ class PlanHandler:
             if review_status != "completed":
                 blockers.append("最终“审查”步骤尚未完成")
             elif not cls._review_step_passed(review_step):
-                blockers.append("最终“审查”未明确通过")
+                # 2026-06 P0-Bug-A 修复：区分"显式未通过"和"未生成有效结论"
+                # verdict="failed" → LLM 显式判失败
+                # verdict="unknown" → LLM 没回结构化 JSON（自然语言兜底分支）
+                review_verdict = str(review_summary.get("verdict", "") or "").strip().lower()
+                if review_verdict == "failed" or review_summary.get("passed") is False:
+                    blockers.append("最终“审查”未通过")
+                else:
+                    blockers.append("最终“审查”未生成有效结论（LLM 未返回结构化 JSON）")
             if not cls._step_has_meaningful_result(review_step):
                 blockers.append("最终“审查”缺少可核验结论")
             blockers.extend(
@@ -481,13 +482,74 @@ class PlanHandler:
             return None
         return self.current_todo
 
-    def finalize_plan(self, plan: dict, session_id: str, action: str = "auto_close") -> None:
+    def finalize_plan(
+        self,
+        plan: dict,
+        session_id: str,
+        action: str = "auto_close",
+    ) -> dict[str, Any]:
         """计划收尾（供 todo_state 模块调用）
 
         封装 auto_close_todo / cancel_todo 中对 handler 私有成员的全部访问，
         包括步骤状态改写、日志、持久化、内存清理。
         注意：unregister_active_todo 和 _emit_todo_lifecycle_event 仍由调用方处理（它们在 todo_state 中）。
+
+        2026-06 L6 升级（与 review 解耦）：
+          - 返回 dict，统一收口信号
+          - action="auto_close" 且 plan 含审查步骤 + review.requires_re_review=True
+            → 不静默关闭，返回 {"closed": False, "block_reason": ..., "suggested_next_round_todo": ...}
+          - action="cancel" 跳过 review 检查（admin 操作）
+          - 旧 None 返回的调用方（todo_state.py:auto_close_todo / cancel_todo）
+            现已更新为消费返回 dict
         """
+        # L6：审查阻止逻辑（仅在 action != "cancel" 时检查）
+        if action != "cancel":
+            review_step = self._get_review_step(plan)
+            if review_step is not None:
+                review_result_text = str(
+                    review_step.get("result_preview")
+                    or review_step.get("result")
+                    or ""
+                )
+                if review_result_text.strip():
+                    review_summary = parse_review_result(
+                        review_result_text,
+                        requires_code_test=bool(plan.get("_requires_code_test", False)),
+                        requires_delivery=bool(plan.get("_requires_delivery", False)),
+                    )
+                    if review_summary.get("requires_re_review"):
+                        blockers = list(review_summary.get("blockers") or [])
+                        message = (
+                            "当前计划未通过最终审查，暂不能标记完成。\n"
+                            f"- {blockers[0] if blockers else '审查未生成有效结论'}\n"
+                            "请基于上述未通过项立即制定下一轮 Todo，继续补齐后再重新审查。"
+                        )
+                        suggested_todo: dict[str, Any] | None = None
+                        try:
+                            suggested_todo = build_next_round_todo(
+                                plan,
+                                blockers=blockers,
+                                review_summary=review_summary,
+                            )
+                        except Exception as exc:  # 防御性兜底
+                            logger.warning(
+                                "[PlanHandler] build_next_round_todo failed: %s", exc,
+                            )
+                        logger.warning(
+                            "[PlanHandler] auto_close blocked: plan=%s verdict=%s blockers=%s",
+                            plan.get("id", ""),
+                            review_summary.get("verdict"),
+                            blockers,
+                        )
+                        return {
+                            "closed": False,
+                            "block_reason": "review_not_concluded",
+                            "blocker_kind": review_summary.get("verdict", "unknown"),
+                            "message": message,
+                            "suggested_next_round_todo": suggested_todo,
+                            "review_summary": review_summary,
+                        }
+
         steps = plan.get("steps", [])
         now = datetime.now().isoformat()
 
@@ -523,6 +585,17 @@ class PlanHandler:
         if self.current_todo is plan:
             self.current_todo = None
         self._store.remove(session_id)
+        return {"closed": True, "message": f"plan {plan.get('id', '')} 已{('取消' if action == 'cancel' else '自动关闭')}"}
+
+    def _get_review_step(self, plan: dict) -> dict[str, Any] | None:
+        """从 plan.steps 里取审查步骤（kind=review 或 description 以"审查："开头）。
+
+        2026-06 L6：finalize_plan 用来做 review 检查。
+        """
+        for step in plan.get("steps", []) or []:
+            if is_review_step(step):
+                return step
+        return None
 
     def _close_superseded_active_plan(
         self,
@@ -749,6 +822,29 @@ class PlanHandler:
         step["result"] = result
         step.setdefault("skills", [])
         step["skills"] = self._ensure_step_skills(step)
+        # 2026-06 L1（主 agent 审查软重试）：
+        # 当 LLM 把审查步骤标记为 completed 但 result 不含 review_status JSON 时，
+        # 不立即让 L6 触发"审查未生成有效结论"分支；先在 step 上标记 review_retry_required，
+        # 并在工具返回消息里给 LLM 一个清晰的重试提示。
+        review_retry_hint: str | None = None
+        if (
+            self._is_review_step(step)
+            and status == "completed"
+            and not is_valid_review_json(str(result or ""))
+            and str(result or "").strip()
+        ):
+            step["review_retry_required"] = True
+            step["retried_count"] = int(step.get("retried_count", 0)) + 1
+            logger.warning(
+                "[Plan] review step %s result is not valid JSON (retried_count=%d)",
+                resolved_step_id, step["retried_count"],
+            )
+            if step["retried_count"] <= REVIEW_MAX_RETRIES:
+                review_retry_hint = (
+                    f"⚠️ 你刚才把审查步骤 {resolved_step_id} 标为 completed，"
+                    f"但 result 中没有 review_status 字段。\n"
+                    f"请重新执行审查并仅输出 JSON 代码块（review_status / passed / blockers / next_actions）。"
+                )
         if self._is_review_step(step) and status in ["completed", "failed", "skipped", "cancelled"]:
             step["review_summary"] = self._parse_review_summary(step, _plan)
 
@@ -817,6 +913,10 @@ class PlanHandler:
                 response += "\n\n✅ 所有步骤已完成，请结束此计划。"
         elif status == "failed":
             response += "\n\n⚠️ 该步骤失败，请检查原因后决定是否重试或跳过。"
+
+        # 2026-06 L1：把审查重试提示追加到工具返回里（软重试）
+        if review_retry_hint:
+            response += f"\n\n{review_retry_hint}"
 
         return response
 

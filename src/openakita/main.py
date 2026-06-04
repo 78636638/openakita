@@ -1070,6 +1070,8 @@ async def run_interactive():
             console.print("[green]✓[/green] Agent 已准备就绪")
         except Exception as e:
             console.print(f"[red]✗ Agent 初始化失败: {e}[/red]")
+            # 记录完整堆栈到文件日志，便于后续排障（终端面板宽度有限只显示 message）。
+            logger.exception("Agent initialization failed")
             shutdown_event.set()
             init_done.set()
             return

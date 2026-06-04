@@ -250,11 +250,31 @@ def auto_close_todo(session_id: str) -> bool:
         )
         return False
 
-    handler.finalize_plan(plan, session_id, action="auto_close")
+    closure_result = handler.finalize_plan(plan, session_id, action="auto_close")
+    if not _consume_finalize_result(closure_result, expected_action="auto_close"):
+        # 审查未生成有效结论：保持 plan 活跃，不 unregister / 不 emit completed
+        # 给 LLM 机会补审查后再关闭
+        return False
     logger.info(f"[Todo] Auto-closed todo for session {session_id}")
 
     unregister_active_todo(session_id)
     _emit_todo_lifecycle_event(session_id, "todo_completed", plan)
+    return True
+
+
+# 2026-06 L6：原 finalize_plan 返回 None，行为未做"审查阻止"。
+# 现升级为返回 dict；下方 closure_result 用于消费 block 信号。
+def _consume_finalize_result(closure_result, *, expected_action: str) -> bool:
+    """消费 finalize_plan 返回 dict；被审查阻止时返回 False（不关 plan）。"""
+    if not isinstance(closure_result, dict):
+        return True  # 兼容旧实现或测试桩
+    if closure_result.get("closed") is False:
+        logger.warning(
+            f"[Todo] finalize_plan blocked ({expected_action}): "
+            f"reason={closure_result.get('block_reason')!r}, "
+            f"message={closure_result.get('message', '')[:200]!r}"
+        )
+        return False
     return True
 
 
@@ -276,7 +296,10 @@ def cancel_todo(session_id: str) -> bool:
         unregister_active_todo(session_id)
         return True
 
-    handler.finalize_plan(plan, session_id, action="cancel")
+    closure_result = handler.finalize_plan(plan, session_id, action="cancel")
+    # cancel 路径跳过 review 检查（action="cancel"），理论上一定 closed=True
+    # 仍消费返回值以便未来扩展（例如 cancel 也要做 review 检查）
+    _consume_finalize_result(closure_result, expected_action="cancel")
     logger.info(f"[Todo] Cancelled todo for session {session_id}")
 
     unregister_active_todo(session_id)

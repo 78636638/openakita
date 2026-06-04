@@ -7,8 +7,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-PASS_MARKERS = ("审查通过", "通过审查", "验收通过", "全部通过", "review passed", "pass")
-
 # 审查步骤重试提示词：当 LLM 未返回有效 JSON 时追加
 # 强化 LLM 输出 JSON 格式的指令，仅在 1 次重试时使用
 REVIEW_RETRY_PROMPT = (
@@ -50,28 +48,40 @@ def is_valid_review_json(text: str) -> bool:
     return status in ("passed", "failed", "needs_follow_up")
 
 
-def build_review_retry_message(original_message: str) -> str:
+def build_review_retry_message(
+    original_message: str,
+    *,
+    previous_output: str | None = None,
+    previous_failure_reason: str | None = None,
+) -> str:
+    """构造重试时发送给 LLM 的消息。
+
+    2026-06 L8 增强：
+      - 携带 LLM 上次输出（前 200 字符）作为 context
+      - 携带上次失败原因（如"未找到 review_status 字段"）
+      - 不再是"凭空"要求 LLM 重写
+
+    Args:
+        original_message: 原任务描述
+        previous_output: LLM 上次返回的完整文本（会被截断到 200 字符）
+        previous_failure_reason: 解析层报出的具体失败原因
+
+    Returns:
+        拼装后的重试消息
     """
-    构造重试时发送给 LLM 的消息：
-    在原任务描述后追加 REVIEW_RETRY_PROMPT，强化 JSON 输出要求。
-    """
-    return original_message + REVIEW_RETRY_PROMPT
-FAIL_MARKERS = (
-    "未通过",
-    "不通过",
-    "审查失败",
-    "验收失败",
-    "存在问题",
-    "存在缺陷",
-    "待修复",
-    "需修复",
-    "需补充",
-    "需要补充",
-    "未完成",
-    "存在幻觉",
-    "存在欺骗",
-    "说谎式完成",
-)
+    ctx_block = ""
+    if previous_output or previous_failure_reason:
+        ctx_parts: list[str] = []
+        if previous_failure_reason:
+            ctx_parts.append(f"上次失败原因：{previous_failure_reason}")
+        if previous_output:
+            truncated = str(previous_output).strip()[:200]
+            if len(str(previous_output)) > 200:
+                truncated += "…（已截断）"
+            ctx_parts.append(f"你上次输出了：\n{truncated}")
+        ctx_block = "\n\n" + "\n".join(ctx_parts) + "\n"
+
+    return original_message + ctx_block + REVIEW_RETRY_PROMPT
 
 
 def is_review_step(step: dict[str, Any] | None) -> bool:
@@ -88,22 +98,85 @@ def parse_review_result(
     *,
     requires_code_test: bool = False,
     requires_delivery: bool = False,
+    trace: list[dict] | None = None,
 ) -> dict[str, Any]:
+    """统一入口：raw text → ReviewSummary dict
+
+    2026-06 L5（结构化日志）：
+      - 各阶段事件写入 trace 列表（可选）
+      - 最终调用一次 logger.debug 记录整个 trace
+      - L1/L6 后续会消费 trace 决定重试/阻止关闭
+
+    返回字段（向后兼容）：
+      verdict, passed, blockers, next_actions, delivery_verified,
+      hallucination_found, test_evidence, raw_result, requires_re_review
+    """
     text = str(result or "").strip()
+    events: list[dict] = [] if trace is None else trace
+    events.append({"event": "input", "raw_length": len(text), "requires_code_test": requires_code_test, "requires_delivery": requires_delivery})
+
     payload = _extract_json_payload(text)
     if isinstance(payload, dict):
-        return _normalize_review_summary(
+        events.append({"event": "json_extracted", "keys": sorted(payload.keys())})
+        summary = _normalize_review_summary(
             payload,
             raw_result=text,
             requires_code_test=requires_code_test,
             requires_delivery=requires_delivery,
+            _events=events,
         )
-    return _normalize_review_summary(
-        _build_fallback_review_summary(text),
-        raw_result=text,
-        requires_code_test=requires_code_test,
-        requires_delivery=requires_delivery,
+    else:
+        events.append({"event": "fallback_used", "reason": "no_json_or_invalid"})
+        summary = _normalize_review_summary(
+            _build_fallback_review_summary(text),
+            raw_result=text,
+            requires_code_test=requires_code_test,
+            requires_delivery=requires_delivery,
+            _events=events,
+        )
+
+    # v0.2 关键字段：requires_re_review
+    #   计算规则（与设计文档 4.3.1 一致）：
+    #     passed is None                  → True（未生成有效结论）
+    #     verdict == "failed" 且 blockers 非空 → True
+    #     verdict == "needs_follow_up"     → True
+    #   其它情况 → False
+    verdict = summary.get("verdict")
+    passed = summary.get("passed")
+    blockers = summary.get("blockers") or []
+    requires_re_review = (
+        passed is None
+        or (verdict == "failed" and bool(blockers))
+        or verdict == "needs_follow_up"
     )
+    summary["requires_re_review"] = requires_re_review
+    events.append({
+        "event": "summary_finalized",
+        "verdict": verdict,
+        "passed": passed,
+        "requires_re_review": requires_re_review,
+        "blocker_count": len(blockers),
+    })
+
+    logger.debug("[ReviewResolve] %s", events)
+    return summary
+
+
+def _is_review_not_concluded(blockers: list[str], review_summary: dict[str, Any]) -> bool:
+    """2026-06 L9：判断"审查未生成有效结论"模式。
+
+    当 LLM 根本没回结构化 JSON（passed is None / verdict=unknown）时，
+    应当让 LLM **重做审查**而不是补 blocker；把 step_1 描述加上 [重做审查] 前缀。
+    """
+    if review_summary.get("passed") is None:
+        return True
+    if review_summary.get("verdict") == "unknown":
+        return True
+    for blocker in blockers or []:
+        text = str(blocker or "")
+        if "未生成" in text and "审查" in text:
+            return True
+    return False
 
 
 def build_next_round_todo(
@@ -113,12 +186,18 @@ def build_next_round_todo(
     review_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = dict(review_summary or {})
+    review_not_concluded = _is_review_not_concluded(blockers, summary)
+
     next_actions = _normalize_list(
         summary.get("next_actions")
         or summary.get("follow_up_actions")
         or summary.get("remediation_steps")
     )
-    if not next_actions:
+
+    # 2026-06 L9：审查未生成有效结论 → 只生成"重做审查"单一 step
+    if review_not_concluded:
+        next_actions = ["重做最终审查：按 JSON 格式输出 review_status / passed / blockers / next_actions"]
+    elif not next_actions:
         next_actions = [f"修复问题：{item}" for item in blockers if str(item or "").strip()]
     if not next_actions:
         next_actions = ["补充缺失证据并重新执行最终审查"]
@@ -130,23 +209,30 @@ def build_next_round_todo(
         depends_on = []
         if index > 1:
             depends_on = [f"step_{index - 1}"]
+        description = str(action).strip()[:512]
+        # 2026-06 L9：审查未生成有效结论 → step_1 显式标 [重做审查]
+        if index == 1 and review_not_concluded and not description.startswith("[重做审查]"):
+            description = f"[重做审查] {description}"
         steps.append(
             {
                 "id": f"step_{index}",
-                "description": str(action).strip()[:512],
+                "description": description,
                 "depends_on": depends_on,
                 "status": "pending",
+                # 2026-06 L9：标记 step 类型，方便编排层/LLM 识别
+                "kind": "re_review" if (index == 1 and review_not_concluded) else "fix",
             }
         )
 
     if not steps:
-        steps = [{"id": "step_1", "description": "补充缺失证据并重新执行最终审查", "status": "pending"}]
+        steps = [{"id": "step_1", "description": "补充缺失证据并重新执行最终审查", "status": "pending", "kind": "fix"}]
 
     task_summary = str(plan.get("task_summary", "") or "当前任务").strip()[:200]
+    source = "review_re_review" if review_not_concluded else "review_failure"
     return {
-        "task_summary": f"{task_summary} - 审查未通过后的下一轮修复",
+        "task_summary": f"{task_summary} - {'审查未生成结论重做' if review_not_concluded else '审查未通过后的下一轮修复'}",
         "generated_from_plan_id": str(plan.get("id", "") or "").strip(),
-        "source": "review_failure",
+        "source": source,
         "review_verdict": summary.get("verdict", "unknown"),
         "blockers": [str(item).strip() for item in blockers if str(item or "").strip()],
         "steps": steps,
@@ -206,10 +292,20 @@ def _normalize_review_summary(
     raw_result: str,
     requires_code_test: bool,
     requires_delivery: bool,
+    _events: list[dict] | None = None,
 ) -> dict[str, Any]:
     delivery_section = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
     tests_section = payload.get("tests") if isinstance(payload.get("tests"), dict) else {}
+    if _events is None:
+        _events = []  # 内部 helper 可被独立调用，此时不收集 trace
 
+    # 2026-06 P0-Bug-A 修复：必须区分 "passed 字段缺失" 与 "passed 显式为 None"。
+    # 旧实现 `bool(payload.get("passed")) if "passed" in payload else None` 会把
+    # passed=None（fallback 路径写进 payload 的值）变成 False，污染编排层判定。
+    passed_raw = payload.get("passed")
+    summary_passed: bool | None = (
+        None if passed_raw is None else bool(passed_raw)
+    )
     summary = {
         "verdict": _normalize_verdict(
             payload.get("review_status")
@@ -219,7 +315,7 @@ def _normalize_review_summary(
             or payload.get("decision")
             or ("passed" if payload.get("passed") else "unknown")
         ),
-        "passed": bool(payload.get("passed")) if "passed" in payload else None,
+        "passed": summary_passed,
         "blockers": _normalize_list(
             payload.get("blockers")
             or payload.get("gaps")
@@ -285,13 +381,18 @@ def _normalize_review_summary(
     }
 
     summary["requires_delivery"] = bool(requires_delivery)
-    if summary["passed"] is None:
+    # 当 verdict="unknown"（即 LLM 没回结构化 JSON）时，passed 必须保持 None，
+    # 不要反推为 False，否则会触发编排层"最终审查未明确通过"的旧分支。
+    # 编排层会按 review_passed is None 单独走"审查未生成有效结论"分支。
+    if summary["passed"] is None and summary["verdict"] != "unknown":
         summary["passed"] = summary["verdict"] == "passed"
     if summary["verdict"] == "unknown" and summary["passed"]:
         summary["verdict"] = "passed"
     # 安全网：若 verdict 是 failed/needs_follow_up，强制 passed 为 False
     if summary["verdict"] in ("failed", "needs_follow_up") and summary["passed"] is True:
         summary["passed"] = False
+        _events.append({"event": "safety_net", "rule": "verdict_passed_contradiction",
+                       "verdict": summary["verdict"]})
         logger.debug(
             "[TodoReview] verdict=%s 与 passed=true 矛盾，强制 passed=False",
             summary["verdict"],
@@ -301,61 +402,48 @@ def _normalize_review_summary(
         summary["passed"] = False
         if "发现幻觉式完成" not in summary["blockers"]:
             summary["blockers"].append("发现幻觉式完成")
+        _events.append({"event": "safety_net", "rule": "hallucination_found"})
     if requires_delivery and summary["delivery_verified"] is False:
         summary["blockers"].append("交付回执或交付物未核验通过")
+        _events.append({"event": "safety_net", "rule": "delivery_not_verified"})
     if summary["missing_deliverables"]:
+        _events.append({"event": "safety_net", "rule": "missing_deliverables",
+                       "items": list(summary["missing_deliverables"])})
         summary["blockers"].extend(
             [f"缺少交付物：{item}" for item in summary["missing_deliverables"] if str(item or "").strip()]
         )
     if summary["test_evidence"]["required"] and summary["test_evidence"]["verified"] is False:
         summary["blockers"].append("测试证据未核验通过")
+        _events.append({"event": "safety_net", "rule": "test_evidence_missing"})
     summary["blockers"] = list(dict.fromkeys(summary["blockers"]))
     summary["next_actions"] = list(dict.fromkeys(summary["next_actions"]))
     return summary
 
 
 def _build_fallback_review_summary(text: str) -> dict[str, Any]:
-    lowered = str(text or "").strip().lower()
-    blockers: list[str] = []
-    verdict = "unknown"
-    if lowered:
-        if any(marker.lower() in lowered for marker in PASS_MARKERS) and not any(
-            marker.lower() in lowered for marker in FAIL_MARKERS
-        ):
-            verdict = "passed"
-        elif any(marker.lower() in lowered for marker in FAIL_MARKERS):
-            verdict = "failed"
-            blockers.append(str(text).strip()[:240])
+    """Fallback review summary when LLM did not return structured JSON.
 
-    delivery_verified = None
-    if any(token in lowered for token in ("交付已核验", "回执已核验", "delivery verified")):
-        delivery_verified = True
-    elif any(token in lowered for token in ("交付未核验", "回执未核验", "缺少交付物")):
-        delivery_verified = False
+    2026-06 P0-Bug-A 修复（不再用硬编码字符串推断审查结论）：
 
-    test_verified = None
-    if any(
-        token in lowered
-        for token in ("已运行 pytest", "已执行 pytest", "已完成测试", "已运行功能测试", "已做回归测试")
-    ):
-        test_verified = True
-    elif any(token in lowered for token in ("未测试", "缺少测试", "没有测试", "未记录测试")):
-        test_verified = False
+    历史实现会把自然语言审查文本当成弱信号，按 "审查通过" / "审查失败" 等
+    子串匹配来反推 verdict。线上曾误判：LLM 写 "审查完成。报告文件存在..."
+    被当成"未匹配 PASS" → verdict="unknown" → passed=False → 报告里出现
+    "最终审查未明确通过"；LLM 写 "飞书推送失败" 也会被当成"审查失败"。
 
-    hallucination_found = None
-    if "无幻觉" in text or "未发现幻觉" in text:
-        hallucination_found = False
-    elif "存在幻觉" in text or "幻觉式完成" in text:
-        hallucination_found = True
-
+    新实现：fallback 不再做字符串兜底，全部字段返回 unknown/None。
+    编排层拿到 verdict="unknown" / passed=None 时会判定为
+    「审查未生成有效结论」并生成下一轮 Todo 让 LLM 重新按 JSON 格式输出。
+    """
     return {
-        "verdict": verdict,
-        "passed": verdict == "passed",
-        "blockers": blockers,
-        "delivery_verified": delivery_verified,
-        "hallucination_found": hallucination_found,
-        "test_verified": test_verified,
-        "next_actions": [],
+        "verdict": "unknown",
+        "passed": None,  # 关键：保留 None，让编排层走"未生成有效结论"分支
+        "blockers": [],
+        "delivery_verified": None,
+        "hallucination_found": None,
+        "test_verified": None,
+        "next_actions": [
+            "重新执行审查步骤，按标准 JSON 格式输出 review_status 字段"
+        ],
     }
 
 

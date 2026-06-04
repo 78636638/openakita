@@ -1219,41 +1219,6 @@ def _should_force_retry_unbacked_delivery_claim(
     return any(marker in text for marker in delivery_claim_markers)
 
 
-_USER_BLOCKED_MARKERS = (
-    "无法继续",
-    "不能继续",
-    "没法继续",
-    "需要用户",
-    "需要你",
-    "请手动",
-    "等待用户",
-    "卡住",
-    "卡在",
-    "遇到技术障碍",
-    "需要人工",
-    "需要协助",
-    "需要帮助",
-    "需要登录",
-    "验证码",
-    "权限不足",
-    "浏览器已关闭",
-    "浏览器被关闭",
-    "被用户关闭",
-)
-
-_USER_BLOCKED_ACTIONS = (
-    "无法",
-    "不能",
-    "没法",
-    "失败",
-    "超时",
-    "卡住",
-    "卡在",
-    "阻塞",
-    "需要",
-    "等待",
-)
-
 _RECOVERABLE_TOOL_ERROR_MARKERS = (
     "未知工具",
     "unknown_tool",
@@ -1272,72 +1237,6 @@ _HARD_USER_BLOCKER_TOOL_MARKERS = (
     "需要用户确认",
     "权限不足",
 )
-
-
-def _looks_like_waiting_for_user_response(text: str) -> bool:
-    """Whether a post-tool final answer is a real user handoff, not a task promise.
-
-    This protects long ReAct tasks from being pushed back into tool execution by
-    completion verification after the model has already reported a blocker such
-    as "需要你截图/请手动确认/浏览器被关闭". Those replies are valid stopping
-    points: the next step must come from the user, not another forced tool call.
-    """
-    normalized = (text or "").strip()
-    if not normalized:
-        return False
-
-    lowered = normalized.lower()
-    if any(
-        marker in lowered
-        for marker in (
-            "waiting for user",
-            "need your help",
-            "need you to",
-            "please provide",
-            "please confirm",
-            "manual confirmation",
-            "cannot continue",
-            "can't continue",
-            "blocked",
-        )
-    ):
-        return True
-
-    if any(marker in normalized for marker in _USER_BLOCKED_MARKERS):
-        return True
-
-    if "请" in normalized and any(
-        marker in normalized
-        for marker in (
-            "手动",
-            "确认",
-            "提供",
-            "截图",
-            "验证码",
-            "登录",
-            "权限",
-        )
-    ):
-        return True
-
-    # More conservative composite check for phrases that split the blocker and
-    # the requested user action across a sentence.
-    has_blocker = any(marker in normalized for marker in _USER_BLOCKED_ACTIONS)
-    asks_user = any(
-        marker in normalized
-        for marker in (
-            "你",
-            "用户",
-            "手动",
-            "确认",
-            "提供",
-            "截图",
-            "验证码",
-            "登录",
-            "权限",
-        )
-    )
-    return has_blocker and asks_user
 
 
 def _has_recoverable_tool_issue(tool_results: list[dict] | None) -> bool:
@@ -8127,12 +8026,21 @@ class ReasoningEngine:
                     cleaned_text, executed_tool_names, all_tool_results
                 )
                 last_user_request = ResponseHandler.get_last_user_request(original_messages)
-                if _looks_like_waiting_for_user_response(
-                    cleaned_text
-                ) and not _has_recoverable_tool_issue(all_tool_results):
+                # 2026-06 P0-Bug-B 修复：移除"文本里像问用户就跳过 verify"的启发式。
+                # 历史问题：_looks_like_waiting_for_user_response 用 "失败"/"无法"/"需要" +
+                # "你" 的子串组合判定"用户被卡住"，导致正常完成总结（"飞书推送失败…
+                # 需要我直接在这里展示完整报告内容，还是你先下载查收？"）被误判
+                # 为「hands control back to user」，TaskVerify 被错误跳过。
+                # 现在唯一的「真的等用户」信号是显式的 ask_user 工具调用
+                # （ask_user 工具本身在 ACT 阶段被拦截，executed_tool_names 里
+                # 出现 ask_user 即代表 LLM 显式暂停等用户）。其它任何情况都跑
+                # TaskVerify 拿真实证据判定 completed / incomplete。
+                if "ask_user" in executed_tool_names and not _has_recoverable_tool_issue(
+                    all_tool_results
+                ):
                     logger.info(
-                        "[TaskVerify] Skipping completion verify because response "
-                        "hands control back to user."
+                        "[TaskVerify] Skipping completion verify because ask_user tool "
+                        "was explicitly called (real user-pause signal)."
                     )
                     self._last_exit_reason = "waiting_user"
                     return cleaned_text
