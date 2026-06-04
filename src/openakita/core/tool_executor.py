@@ -89,6 +89,55 @@ def _get_read_file_default_limit() -> int:
         return 2000
 
 
+# ========== P0-2: 工具执行跟踪器（用于审查前等待所有 pending 工具完成）==========
+_RUNNING_TOOL_TRACKER: dict[str, float] = {}
+_RUNNING_TOOL_TRACKER_LOCK = asyncio.Lock()
+
+
+async def mark_tool_running(tool_name: str) -> None:
+    """P0-2: 标记一个工具调用开始执行。"""
+    name = str(tool_name or "").strip()
+    if not name:
+        return
+    async with _RUNNING_TOOL_TRACKER_LOCK:
+        _RUNNING_TOOL_TRACKER[name] = time.monotonic()
+
+
+async def mark_tool_completed(tool_name: str) -> None:
+    """P0-2: 标记一个工具调用已完成。"""
+    name = str(tool_name or "").strip()
+    if not name:
+        return
+    async with _RUNNING_TOOL_TRACKER_LOCK:
+        _RUNNING_TOOL_TRACKER.pop(name, None)
+
+
+async def get_running_tools() -> list[str]:
+    """P0-2: 获取当前正在执行的工具名列表。"""
+    async with _RUNNING_TOOL_TRACKER_LOCK:
+        return list(_RUNNING_TOOL_TRACKER.keys())
+
+
+async def wait_all_tools_completed(timeout: float = 30.0, poll_interval: float = 0.5) -> bool:
+    """P0-2: 等待所有 pending 工具完成执行（带超时）。
+
+    Args:
+        timeout: 最大等待秒数
+        poll_interval: 轮询间隔
+
+    Returns:
+        True: 全部完成（或无 pending 工具）
+        False: 超时（仍有 pending 工具）
+    """
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while time.monotonic() < deadline:
+        pending = await get_running_tools()
+        if not pending:
+            return True
+        await asyncio.sleep(poll_interval)
+    return False
+
+
 def save_overflow(tool_name: str, content: str) -> str:
     """将大输出保存到溢出文件，返回文件路径。
 
@@ -785,6 +834,8 @@ class ToolExecutor:
 
         tracer = get_tracer()
         started_at = time.monotonic()
+        # P0-2: 标记工具开始执行（用于审查前等待所有 pending 工具完成）
+        await mark_tool_running(tool_name)
         with tracer.tool_span(tool_name=tool_name, input_data=tool_input) as span:
             try:
                 # 通过 handler_registry 执行
@@ -919,6 +970,9 @@ class ToolExecutor:
                     error_type=tool_error.error_type.value,
                 )
                 return error_result, None
+            finally:
+                # P0-2: 标记工具执行完成（无论成功/失败/异常）
+                await mark_tool_completed(tool_name)
 
     def _record_experience(
         self,

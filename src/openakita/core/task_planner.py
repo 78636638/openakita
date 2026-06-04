@@ -1312,6 +1312,27 @@ class TaskExecutor:
             )
 
             if is_review_step({"description": sub_task.description}):
+                # P0-2: 审查启动前等待所有 pending 工具完成（防审查时机错位）
+                try:
+                    from .tool_executor import (
+                        get_running_tools,
+                        wait_all_tools_completed,
+                    )
+                    pending_before = await get_running_tools()
+                    if pending_before:
+                        logger.info(
+                            "[TaskExecutor] 审查子任务 %s 启动前等待 %d 个 pending 工具: %s",
+                            sub_task.id, len(pending_before), pending_before,
+                        )
+                        completed = await wait_all_tools_completed(timeout=30.0)
+                        if not completed:
+                            logger.warning(
+                                "[TaskExecutor] 审查启动前等待超时，仍有 pending: %s",
+                                await get_running_tools(),
+                            )
+                except Exception as _wait_exc:
+                    logger.debug("[TaskExecutor] wait_all_tools_completed 失败: %s", _wait_exc)
+
                 for retry_idx in range(REVIEW_MAX_RETRIES):
                     if is_valid_review_json(str(result or "")):
                         break

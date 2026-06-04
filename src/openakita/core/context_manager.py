@@ -477,24 +477,121 @@ class ContextManager:
         total_tokens = pressure.estimated_total_tokens
         # 有效工作区间：60k tokens（基于 MiniMax M2.7 实际表现）
         effective_working_limit = 60000
-        hard_total_limit = 80000  # 硬上限，超过则强制截断
+        # 动态硬上限：基于 pressure.hard_limit（实际上下文窗口），确保与压力计算对齐
+        # 旧版硬编码 80K 在 160K 模型下是死代码，改为动态后作为软压缩失败时的兜底
+        hard_total_limit = pressure.hard_limit or 80000  # 兜底用 80K
 
-        # 硬上限保护：总输入超过 80k 时，强制只保留最近 4 轮对话
+        # P1-1: 软警告区（90% hard_limit - hard_limit）提前软压缩，避免触发硬截断
+        soft_warning_limit = int(hard_total_limit * 0.9)
+        if soft_warning_limit < total_tokens <= hard_total_limit:
+            logger.info(
+                f"[P1-1] 软警告区: {total_tokens} > {soft_warning_limit}, 主动软压缩（不粗暴截断）"
+            )
+
+            # P1-6: 软压缩前也落盘到记忆（防止软压缩导致数据丢失）
+            if memory_manager is not None:
+                try:
+                    snapshot = self._build_precompact_snapshot(messages, memory_manager)
+                    save_snapshot = getattr(memory_manager, "save_precompact_snapshot", None)
+                    if snapshot and callable(save_snapshot):
+                        save_snapshot(snapshot)
+                    logger.info(f"[P1-6] 软压缩前落盘完成: {len(messages)} 条消息")
+                except Exception as e:
+                    logger.warning(f"[P1-6] 软压缩前落盘失败（不影响主流程）: {e}")
+
+            # 步骤 1: 归档大 tool_result（轻量、零丢失）
+            messages = await self._archive_long_tool_results(messages, max_inline_chars=5000)
+            new_tokens = self.estimate_messages_tokens(messages)
+            logger.info(f"[P1-1] 归档后: {total_tokens} → {new_tokens}")
+
+            if new_tokens > soft_warning_limit:
+                # 步骤 2: LLM 摘要旧历史（保留知识）
+                recent_count = min(8, len(messages))
+                old_messages = (
+                    messages[:-recent_count] if len(messages) > recent_count else []
+                )
+                summary = None
+                if old_messages:
+                    summary = await self._progressive_summarize(old_messages)
+                # 步骤 3: 损失最小化截断（锚点 + 摘要 + 最近）
+                messages = self._build_lossless_truncation(
+                    messages, max_preserved_turns=4, summary=summary
+                )
+                # P1-3: 注入系统通知（仅在确有摘要时）
+                messages = self._maybe_append_truncation_notice(
+                    messages, summary=summary, archive_count=0
+                )
+                final_tokens = self.estimate_messages_tokens(messages)
+                logger.info(
+                    f"[P1-1] 软压缩完成: {total_tokens} → {final_tokens} tokens, "
+                    f"避开了硬截断"
+                )
+            return messages
+
+        # 硬上限保护：总输入超过 hard_total_limit 时，强制压缩（保留率最大化）
+        # 极端兜底：仅在软压缩未生效时触发
         if total_tokens > hard_total_limit:
             logger.warning(
                 f"[Compress] Total input {total_tokens} exceeds hard limit {hard_total_limit}, "
-                f"forcing aggressive truncation to last 4 turns"
+                f"applying P0 保留策略（保留任务锚点 + 摘要 + 最近对话）"
             )
-            # 只保留最近 4 轮对话（8 条消息：user-assistant 配对）
-            preserved_turns = 4
-            preserved_count = min(preserved_turns * 2, len(messages))
-            truncated = messages[-preserved_count:]
-            truncated_tokens = self.estimate_messages_tokens(truncated)
+
+            # P1-6: 硬截断前强制落盘到记忆（防丢失，依赖 memory_manager）
+            if memory_manager is not None:
+                try:
+                    snapshot = self._build_precompact_snapshot(messages, memory_manager)
+                    save_snapshot = getattr(memory_manager, "save_precompact_snapshot", None)
+                    if snapshot and callable(save_snapshot):
+                        save_snapshot(snapshot)
+                    on_compressing = getattr(memory_manager, "on_context_compressing", None)
+                    if on_compressing:
+                        await on_compressing(messages)
+                    logger.info(
+                        f"[P1-6] 硬截断前落盘完成: {len(messages)} 条消息已备份到记忆"
+                    )
+                except Exception as e:
+                    logger.warning(f"[P1-6] 硬截断前落盘失败（不影响主流程）: {e}")
+            else:
+                logger.debug("[P1-6] memory_manager 为 None，跳过硬截断前落盘")
+
+            # P0-3: 归档过大的 tool_result 到 overflow 文件（保留全量 + 摘要）
+            messages = await self._archive_long_tool_results(messages, max_inline_chars=3000)
+            current_tokens_after_archive = self.estimate_messages_tokens(messages)
             logger.info(
-                f"[Compress] Hard truncated from {len(messages)} msgs to {len(truncated)} msgs, "
-                f"{total_tokens} tokens to {truncated_tokens} tokens"
+                f"[P0-3] 归档后 token: {total_tokens} → {current_tokens_after_archive}"
             )
-            return self._sanitize_tool_pairs(truncated)
+
+            if current_tokens_after_archive > hard_total_limit:
+                # P0-2: 用 LLM 渐进式摘要"被截断"的历史（保留知识而非原文）
+                recent_count = min(8, len(messages))
+                old_messages = messages[:-recent_count] if len(messages) > recent_count else []
+                summary = None
+                if old_messages:
+                    summary = await self._progressive_summarize(old_messages)
+                else:
+                    logger.debug("[P0-2] 无足够历史可摘要，跳过 LLM 摘要")
+
+                # P0-1: 损失最小化截断（任务锚点 + 摘要 + 最近对话）
+                truncated = self._build_lossless_truncation(
+                    messages, max_preserved_turns=4, summary=summary
+                )
+            else:
+                truncated = messages
+                summary = None  # 归档后已降回，无摘要
+
+            # P1-3: 截断后注入系统通知（让 LLM 知道历史已压缩）
+            truncated = self._maybe_append_truncation_notice(
+                truncated, summary=summary, archive_count=1 if current_tokens_after_archive < total_tokens else 0
+            )
+
+            truncated_tokens = self.estimate_messages_tokens(truncated)
+            preserved_rate = truncated_tokens * 100.0 / max(total_tokens, 1)
+            logger.info(
+                f"[Compress] P0 truncated from {len(messages)} msgs to {len(truncated)} msgs, "
+                f"{total_tokens} tokens to {truncated_tokens} tokens "
+                f"(保留率: {preserved_rate:.1f}%, 提升 {(preserved_rate - 100.0 * min(8, len(messages)) / max(len(messages), 1)):.1f}%)"
+            )
+            return truncated
 
         should_compress = (
             force
@@ -858,6 +955,311 @@ class ContextManager:
             content[item_idx] = item
             result[msg_idx] = {**msg, "content": content}
 
+        return result
+
+    async def _archive_long_tool_results(
+        self, messages: list[dict], max_inline_chars: int = 5000
+    ) -> list[dict]:
+        """P0-3: 将过大的 tool_result 内容归档到 overflow 文件，保留摘要 + 文件路径。
+
+        防止 LLM 上下文爆炸的同时保留全量数据可追溯性。
+        归档条件：单条 tool_result 内容超过 max_inline_chars。
+        """
+        from .tool_executor import save_overflow
+
+        if not messages:
+            return messages
+
+        result = [dict(msg) for msg in messages]
+        archive_count = 0
+
+        for msg_idx, msg in enumerate(result):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            new_content = []
+            modified = False
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    result_text = str(item.get("content", ""))
+                    if (
+                        result_text
+                        and len(result_text) > max_inline_chars
+                        and OVERFLOW_MARKER not in result_text
+                    ):
+                        try:
+                            overflow_path = save_overflow("preserved", result_text)
+                            summary = result_text[:300].replace("\n", " ")
+                            archived_item = dict(item)
+                            archived_item["content"] = (
+                                f"[已归档到 {overflow_path}]\n"
+                                f"[原始 {len(result_text)} 字符，前 300 字符摘要]\n"
+                                f"{summary}...\n"
+                                f"如需查看完整内容，请使用 read_file 工具读取 {overflow_path}"
+                            )
+                            new_content.append(archived_item)
+                            modified = True
+                            archive_count += 1
+                            continue
+                        except Exception as archive_exc:
+                            logger.debug(f"[P0-3] 归档失败: {archive_exc}")
+                new_content.append(item)
+
+            if modified:
+                result[msg_idx] = {**msg, "content": new_content}
+
+        if archive_count:
+            logger.info(f"[P0-3] 归档了 {archive_count} 条过大 tool_result 到 overflow 文件")
+
+        return result
+
+    async def _progressive_summarize(
+        self,
+        messages_to_summarize: list[dict],
+        max_summary_tokens: int = 800,
+    ) -> str | None:
+        """P0-2: 用 LLM 渐进式摘要旧消息，保留知识而非原文。
+
+        P1-9 增强：复用 _previous_summaries 缓存，相同内容跳过 LLM 调用。
+        - 输入：要摘要的消息列表
+        - 输出：800 token 内的摘要
+        - 失败时返回 None（让调用方走 fallback）
+        """
+        if not messages_to_summarize:
+            return None
+
+        # P1-9: 缓存命中检查（复用软压缩的 _previous_summaries）
+        if not hasattr(self, "_previous_summaries"):
+            self._previous_summaries: dict[str, str] = {}
+        cache_key = self._compute_messages_hash(messages_to_summarize, prefix="prog")
+        if cache_key in self._previous_summaries:
+            cached = self._previous_summaries[cache_key]
+            logger.info(f"[P1-9] 摘要缓存命中: key={cache_key[:8]}..., len={len(cached)}")
+            return cached
+
+        if not getattr(self, "_brain", None):
+            logger.debug("[P0-2] 无 brain 引用，跳过 LLM 摘要")
+            return None
+
+        try:
+            formatted = self._format_messages_for_summary(messages_to_summarize)
+        except Exception as fmt_exc:
+            logger.debug(f"[P0-2] 格式化消息失败: {fmt_exc}")
+            return None
+
+        if not formatted.strip():
+            return None
+
+        summary_prompt = (
+            "请用 500-800 字内总结以下对话的关键信息，必须包含：\n"
+            "1. 用户的核心目标与约束（最重要的，保留原文措辞）\n"
+            "2. 已完成的关键步骤及产出（文件路径、数据规模等）\n"
+            "3. 中间产生的重要数据/中间结果（用简明列表）\n"
+            "4. 当前进行中的任务状态\n"
+            "5. 待办事项与未决问题\n\n"
+            "对话内容：\n"
+            f"{formatted[:60000]}"
+        )
+
+        try:
+            response = await asyncio.wait_for(
+                self._brain.think(
+                    prompt=summary_prompt,
+                    system="你是一个精确的信息摘要助手。只输出摘要内容，不要任何解释或前缀。",
+                    max_tokens=max_summary_tokens,
+                    enable_thinking=False,
+                ),
+                timeout=15.0,
+            )
+            if response and isinstance(response, str):
+                summary_text = response.strip()
+                if len(summary_text) > 50:
+                    logger.info(
+                        f"[P0-2] 渐进式摘要生成成功: {len(formatted)} 字符 → {len(summary_text)} 字符"
+                    )
+                    # P1-9: 写入缓存
+                    self._previous_summaries[cache_key] = summary_text
+                    self._enforce_summary_cache_limit()
+                    return summary_text
+        except TimeoutError:
+            logger.warning("[P0-2] LLM 摘要超时（15s），使用 fallback")
+        except Exception as sum_exc:
+            logger.warning(f"[P0-2] LLM 摘要失败: {sum_exc}")
+
+        return None
+
+    def _compute_messages_hash(self, messages: list[dict], prefix: str = "") -> str:
+        """P1-9: 计算消息列表的稳定 hash key（用于摘要缓存）"""
+        import hashlib
+
+        # 仅取每条消息的前 200 字符内容（避免大对象序列化）
+        sample = []
+        for msg in messages[-30:]:  # 与 _format_messages_for_summary 对齐
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", item.get("content", ""))[:200])
+                    for item in content
+                    if isinstance(item, dict)
+                )
+            sample.append(f"{role}:{str(content)[:200]}")
+        content_str = "|".join(sample)
+        digest = hashlib.md5(content_str.encode("utf-8")).hexdigest()[:16]
+        return f"{prefix}_{digest}"
+
+    def _enforce_summary_cache_limit(self, max_entries: int = 50) -> None:
+        """P1-9: 限制摘要缓存大小（LRU 简化版：FIFO 淘汰）"""
+        if not hasattr(self, "_previous_summaries"):
+            return
+        if len(self._previous_summaries) <= max_entries:
+            return
+        # 简单 FIFO 淘汰最早 10 个
+        excess = len(self._previous_summaries) - max_entries + 10
+        if excess > 0:
+            keys_to_remove = list(self._previous_summaries.keys())[:excess]
+            for k in keys_to_remove:
+                self._previous_summaries.pop(k, None)
+            logger.debug(f"[P1-9] 缓存淘汰: 移除 {excess} 条")
+
+    def _maybe_append_truncation_notice(
+        self,
+        messages: list[dict],
+        summary: str | None = None,
+        archive_count: int = 0,
+    ) -> list[dict]:
+        """P1-3: 截断/压缩后追加系统通知（仅在确有摘要或归档时注入）
+
+        使用「【系统通知 - 非用户输入】」前缀明确标记，避免 LLM 误判为用户指令。
+        注入条件：实际发生了摘要生成或归档（避免空注入污染对话）。
+        """
+        if not messages:
+            return messages
+        if not summary and archive_count <= 0:
+            return messages  # 没有任何损失，无需通知
+
+        parts = ["【系统通知 - 非用户输入】之前的对话历史已压缩："]
+        if summary:
+            parts.append(f"- LLM 摘要已生成（{len(summary)} 字符）")
+        if archive_count > 0:
+            parts.append(f"- {archive_count} 条大工具结果已归档到 overflow 文件")
+        parts.append(
+            "如需查询历史细节，可使用 read_file 工具读取归档文件，"
+            "不必逐字引用摘要内容。"
+        )
+        notice = {"role": "user", "content": "\n".join(parts)}
+        result = list(messages) + [notice]
+        return self._sanitize_tool_pairs(result)
+
+    def _format_messages_for_summary(self, messages: list[dict]) -> str:
+        """将消息列表格式化为可读文本，用于 LLM 摘要输入"""
+        lines: list[str] = []
+        for idx, msg in enumerate(messages[-30:]):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", item.get("content", ""))[:500])
+                    for item in content
+                    if isinstance(item, dict)
+                )
+            content_str = str(content)[:2000].replace("\n", " ")
+            if content_str:
+                lines.append(f"[{idx+1}] {role}: {content_str}")
+        return "\n".join(lines)
+
+    def _build_lossless_truncation(
+        self,
+        messages: list[dict],
+        max_preserved_turns: int = 4,
+        summary: str | None = None,
+    ) -> list[dict]:
+        """P0-1: 有损但有记忆的截断：保留任务锚点 + 摘要 + 最近对话。
+
+        - 任务锚点：系统提示、用户首条消息
+        - 关键工具结果：路径/计数/状态类
+        - 摘要：可选的 LLM 生成摘要（替代粗暴丢弃）
+        - 最近对话：最后 N 轮
+        """
+        if not messages:
+            return messages
+
+        # 1. 找出任务锚点
+        anchors: list[dict] = []
+        anchor_ids: set[int] = set()
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # 系统消息必留
+            if role == "system":
+                anchors.append(msg)
+                anchor_ids.add(i)
+                continue
+
+            # 用户首条消息必留（任务定义）
+            if role == "user" and i <= 2:
+                anchors.append(msg)
+                anchor_ids.add(i)
+                continue
+
+            # 关键工具结果（包含路径、计数、状态）
+            if role == "tool":
+                content_str = str(content) if not isinstance(content, list) else str(content)
+                if any(
+                    kw in content_str
+                    for kw in [
+                        "saved to:",
+                        "Total:",
+                        "ERROR",
+                        "FAILED",
+                        "file://",
+                        "/data/",
+                        "完成",
+                        "成功",
+                    ]
+                ):
+                    truncated_msg = dict(msg)
+                    if isinstance(content, str) and len(content) > 500:
+                        truncated_msg["content"] = (
+                            content[:300]
+                            + f"\n[... 截断，原始 {len(content)} 字符 ...]\n"
+                            + content[-150:]
+                        )
+                    anchors.append(truncated_msg)
+                    anchor_ids.add(i)
+
+        # 2. 找出最近 N 轮
+        recent_count = min(max_preserved_turns * 2, len(messages))
+        recent = messages[-recent_count:]
+
+        # 3. 合并
+        result = list(anchors)
+
+        # 4. 如果有 LLM 摘要，插入一条"历史回顾"
+        if summary:
+            summary_msg = {
+                "role": "user",
+                "content": (
+                    "【系统提示：以下是被压缩的历史对话摘要，供参考但不必逐字引用】\n"
+                    f"{summary}"
+                ),
+            }
+            result.append(summary_msg)
+            summary_ack = {
+                "role": "assistant",
+                "content": "已收到历史摘要，将结合历史与当前对话继续执行任务。",
+            }
+            result.append(summary_ack)
+
+        # 5. 添加最近对话（去重）
+        for msg in recent:
+            if id(msg) not in {id(m) for m in result}:
+                result.append(msg)
+
+        # 6. 工具配对修复
+        result = self._sanitize_tool_pairs(result)
         return result
 
     async def _llm_compress_text(
